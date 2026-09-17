@@ -4,6 +4,11 @@ import sys
 import os
 from datetime import datetime, timezone
 from pymongo import MongoClient
+import socket
+
+HOSTNAME = socket.gethostname()
+TRIVY_IMAGE = "trivy:sweri"
+WAZUH_JSONL = "/var/log/sbom/trivy-findings.jsonl"
 
 SEVERITY_RANK = {
     "critical": 5, "high": 4, "medium": 3,
@@ -29,40 +34,51 @@ def extract_fixed_version(vuln):
             return p.get("value")
     return None
 
+def trivy_version():
+    try:
+        r = subprocess.run(
+            ["docker", "run", "--rm", TRIVY_IMAGE, "--version"],
+            capture_output=True, text=True
+        )
+        for line in r.stdout.splitlines():
+            if line.lower().startswith("version"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return "unknown"
+
 def scan_image(image, out_dir):
     """Run Trivy against one image, return the output path."""
     os.makedirs(out_dir, exist_ok=True)
     safe_name = image.replace("/", "_").replace(":", "_")
     out_path = os.path.join(out_dir, f"{safe_name}.json")
 
-    print(f"\n{'='*60}")
-    print(f"Scanning: {image}")
-    print(f"{'='*60}")
+    print(f"\n  scanning  {image}")
 
     cmd = [
         "docker", "run", "--rm",
-        "-v", "//var/run/docker.sock:/var/run/docker.sock",
-        "-v", f"{os.getcwd().replace(os.sep, '/')}/{out_dir}:/out",
-        "aquasec/trivy", "image",
+        "-v", "/var/run/docker.sock:/var/run/docker.sock",
+        "-v", f"{os.path.abspath(out_dir)}:/out",
+        TRIVY_IMAGE, "image",
         "--scanners", "vuln",
         "--format", "cyclonedx",
+        "--timeout", "30m",
         "--output", f"/out/{safe_name}.json",
         image,
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"  SCAN FAILED: {result.stderr[:300]}")
+        print(f"     scan failed: {result.stderr.strip()[:200]}")
         return None
 
     if not os.path.exists(out_path):
-        print(f"  OUTPUT MISSING: {out_path}")
+        print(f"     output missing")
         return None
 
-    print(f"  Output: {out_path}")
     return out_path
 
-def ingest_scan(filepath, image_tag, db):
+def ingest_scan(filepath, image_tag, db, scanner_version):
     """Parse CycloneDX and store in MongoDB."""
     with open(filepath, "r", encoding="utf-8") as f:
         sbom = json.load(f)
@@ -121,9 +137,12 @@ def ingest_scan(filepath, image_tag, db):
             fv["first_seen"] = existing["first_seen"]
 
     doc = {
+        "host": HOSTNAME,
         "image": image_tag,
         "scanned_at": scanned_at,
         "source_file": filepath,
+        "scanner": "trivy",
+        "scanner_version": scanner_version,
         "component_count": len(components),
         "vulnerability_count": len(flat_vulns),
         "new_vulnerability_count": len(new_findings),
@@ -139,22 +158,47 @@ def ingest_scan(filepath, image_tag, db):
         "vulnerabilities": flat_vulns,
     }
 
-    result = db["scans"].insert_one(doc)
+    db["scans"].insert_one(doc)
     return {
         "image": image_tag,
-        "scan_id": str(result.inserted_id),
         "components": len(components),
         "vulnerabilities": len(flat_vulns),
         "new": len(new_findings),
         "new_findings": new_findings,
     }
 
+def write_wazuh_events(result, image_tag):
+    """Append only NEW findings to the Wazuh log, so we never re-flood the agent."""
+    new = result.get("new_findings", [])
+    if not new:
+        return 0
+    os.makedirs(os.path.dirname(WAZUH_JSONL), exist_ok=True)
+    ts = datetime.now(timezone.utc).isoformat()
+    written = 0
+    try:
+        with open(WAZUH_JSONL, "a") as out:
+            for fv in new:
+                event = {
+                    "source": "trivy",
+                    "host": HOSTNAME,
+                    "image": image_tag,
+                    "cve_id": fv.get("cve_id"),
+                    "severity": fv.get("severity"),
+                    "package_name": fv.get("package_name"),
+                    "installed_version": fv.get("installed_version"),
+                    "fixed_version": fv.get("fixed_version"),
+                    "purl": fv.get("purl"),
+                    "timestamp": ts,
+                }
+                out.write(json.dumps(event) + "\n")
+                written += 1
+    except PermissionError:
+        print(f"     wazuh log not writable ({WAZUH_JSONL})")
+    return written
+
 def generate_report(image_tag, db, out_dir):
     """Generate markdown vulnerability summary."""
-    scan = db["scans"].find_one(
-        {"image": image_tag},
-        sort=[("scanned_at", -1)]
-    )
+    scan = db["scans"].find_one({"image": image_tag}, sort=[("scanned_at", -1)])
     if not scan:
         return
 
@@ -178,12 +222,20 @@ def generate_report(image_tag, db, out_dir):
     lines.append(f"# Vulnerability Summary: {image_tag}")
     lines.append("")
     lines.append(f"**Scan date:** {scan['scanned_at'].strftime('%d %B %Y, %H:%M UTC')}")
+    lines.append(f"**Scanner:** trivy {scan.get('scanner_version', 'unknown')}")
+    lines.append(f"**Host:** {scan.get('host', 'unknown')}")
     lines.append(f"**Components:** {scan.get('component_count', len(components))}")
     lines.append(f"**Total vulnerabilities:** {len(vulns)}")
     lines.append(f"**New since last scan:** {scan.get('new_vulnerability_count', len(new_findings))}")
     lines.append(f"**With fix available:** {len(fixable)}")
     lines.append(f"**Critical + High:** {len(actionable)}")
     lines.append("")
+
+    if components and not vulns:
+        lines.append("> Note: components inventoried but no vulnerabilities returned. "
+                     "If this is an ML image, Conda-installed Python packages are not "
+                     "detected by Trivy and may be missing from the inventory.")
+        lines.append("")
 
     lines.append("## Severity Breakdown")
     lines.append("")
@@ -214,25 +266,40 @@ def generate_report(image_tag, db, out_dir):
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    print(f"  Report: {report_path}")
+def discover_images():
+    """List all images present on this host (not just running ones)."""
+    cmd = ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    images = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or "<none>" in line:
+            continue
+        if line.startswith(("trivy", "aquasec/trivy", "mongo")):
+            continue  # skip tooling images
+        images.append(line)
+    return sorted(set(images))
 
 def main():
-    inventory_file = sys.argv[1] if len(sys.argv) > 1 else "inventory.txt"
     out_dir = "out"
 
-    if not os.path.exists(inventory_file):
-        print(f"Inventory file not found: {inventory_file}")
-        sys.exit(1)
-
-    with open(inventory_file, "r") as f:
-        images = [line.strip() for line in f if line.strip()]
+    if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+        with open(sys.argv[1]) as f:
+            images = [l.strip() for l in f if l.strip()]
+        source = f"inventory file {sys.argv[1]}"
+    else:
+        images = discover_images()
+        source = "host image discovery"
 
     if not images:
-        print("No images in inventory file")
+        print("No images found to scan")
         sys.exit(1)
 
-    print(f"SBOM Pipeline Run: {datetime.now(timezone.utc).strftime('%d %B %Y, %H:%M UTC')}")
-    print(f"Images to scan: {len(images)}")
+    run_time = datetime.now(timezone.utc).strftime('%d %B %Y, %H:%M UTC')
+    scanner_version = trivy_version()
+
+    print(f"\nSBOM pipeline  {run_time}")
+    print(f"host {HOSTNAME}  |  trivy {scanner_version}  |  {len(images)} images via {source}")
 
     client = MongoClient("mongodb://localhost:27017")
     db = client["sweri_sbom"]
@@ -241,25 +308,25 @@ def main():
     for image in images:
         out_path = scan_image(image, out_dir)
         if out_path:
-            result = ingest_scan(out_path, image, db)
-            results.append(result)
-            print(f"  Components: {result['components']}")
-            print(f"  Vulnerabilities: {result['vulnerabilities']}")
-            print(f"  NEW: {result['new']}")
+            result = ingest_scan(out_path, image, db, scanner_version)
+            sent = write_wazuh_events(result, image)
             generate_report(image, db, out_dir)
+            result["wazuh_sent"] = sent
+            results.append(result)
+            print(f"     {result['components']} components  |  "
+                  f"{result['vulnerabilities']} vulns  |  "
+                  f"{result['new']} new  |  {sent} to wazuh")
         else:
             results.append({"image": image, "error": "scan failed"})
 
-    print(f"\n{'='*60}")
-    print("PIPELINE COMPLETE")
-    print(f"{'='*60}")
+    print(f"\ncomplete  {HOSTNAME}")
     for r in results:
         if "error" in r:
-            print(f"  FAILED: {r['image']}")
+            print(f"  x  {r['image']}  failed")
         else:
-            status = "NEW FINDINGS" if r["new"] > 0 else "no changes"
-            print(f"  {r['image']}: {r['vulnerabilities']} vulns, "
-                  f"{r['new']} new ({status})")
+            flag = "  *" if r["new"] > 0 else "   "
+            print(f"{flag} {r['image']}  {r['components']} comp, "
+                  f"{r['vulnerabilities']} vuln, {r['new']} new")
 
 if __name__ == "__main__":
     main()
