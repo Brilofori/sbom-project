@@ -15,6 +15,7 @@ SEVERITY_RANK = {
     "low": 2, "info": 1, "none": 0, "unknown": 0,
 }
 
+
 def highest_severity(ratings):
     best, best_rank = "unknown", -1
     for r in ratings or []:
@@ -23,6 +24,7 @@ def highest_severity(ratings):
         if rank > best_rank:
             best, best_rank = sev, rank
     return best
+
 
 def extract_fixed_version(vuln):
     for aff in vuln.get("affects", []):
@@ -33,6 +35,7 @@ def extract_fixed_version(vuln):
         if "fixed" in (p.get("name") or "").lower():
             return p.get("value")
     return None
+
 
 def trivy_version():
     try:
@@ -46,6 +49,7 @@ def trivy_version():
     except Exception:
         pass
     return "unknown"
+
 
 def scan_image(image, out_dir):
     """Run Trivy against one image, return the output path."""
@@ -78,8 +82,9 @@ def scan_image(image, out_dir):
 
     return out_path
 
+
 def ingest_scan(filepath, image_tag, db, scanner_version):
-    """Parse CycloneDX and store in MongoDB."""
+    """Parse CycloneDX, store in MongoDB, track first-seen for components and vulns."""
     with open(filepath, "r", encoding="utf-8") as f:
         sbom = json.load(f)
 
@@ -136,6 +141,35 @@ def ingest_scan(filepath, image_tag, db, scanner_version):
             fv["is_new"] = False
             fv["first_seen"] = existing["first_seen"]
 
+    db["component_state"].create_index(
+        [("image", 1), ("comp_key", 1)], unique=True
+    )
+
+    new_components = []
+    for c in components:
+        name = c.get("name")
+        if not name:
+            continue
+        version = c.get("version")
+        purl = c.get("purl")
+        ckey = purl or f"{name}@{version}"
+        key = {"image": image_tag, "comp_key": ckey}
+        if db["component_state"].find_one(key) is None:
+            db["component_state"].insert_one({
+                **key,
+                "first_seen": scanned_at,
+                "name": name,
+                "version": version,
+                "purl": purl,
+                "type": c.get("type"),
+            })
+            new_components.append({
+                "name": name,
+                "version": version,
+                "purl": purl,
+                "type": c.get("type"),
+            })
+
     doc = {
         "host": HOSTNAME,
         "image": image_tag,
@@ -146,6 +180,7 @@ def ingest_scan(filepath, image_tag, db, scanner_version):
         "component_count": len(components),
         "vulnerability_count": len(flat_vulns),
         "new_vulnerability_count": len(new_findings),
+        "new_component_count": len(new_components),
         "components": [
             {
                 "name": c.get("name"),
@@ -162,24 +197,44 @@ def ingest_scan(filepath, image_tag, db, scanner_version):
     return {
         "image": image_tag,
         "components": len(components),
+        "new_components_count": len(new_components),
+        "new_components": new_components,
         "vulnerabilities": len(flat_vulns),
         "new": len(new_findings),
         "new_findings": new_findings,
     }
 
+
 def write_wazuh_events(result, image_tag):
-    """Append only NEW findings to the Wazuh log, so we never re-flood the agent."""
-    new = result.get("new_findings", [])
-    if not new:
+    """Append new components and new vulnerabilities to the Wazuh log.
+    Only new items are sent, so rescans never re-flood the agent."""
+    new_comps = result.get("new_components", [])
+    new_vulns = result.get("new_findings", [])
+    if not new_comps and not new_vulns:
         return 0
-    os.makedirs(os.path.dirname(WAZUH_JSONL), exist_ok=True)
+
     ts = datetime.now(timezone.utc).isoformat()
     written = 0
     try:
+        os.makedirs(os.path.dirname(WAZUH_JSONL), exist_ok=True)
         with open(WAZUH_JSONL, "a") as out:
-            for fv in new:
-                event = {
+            for c in new_comps:
+                out.write(json.dumps({
                     "source": "trivy",
+                    "sbom_event": "component",
+                    "host": HOSTNAME,
+                    "image": image_tag,
+                    "package_name": c.get("name"),
+                    "installed_version": c.get("version"),
+                    "package_type": c.get("type"),
+                    "purl": c.get("purl"),
+                    "timestamp": ts,
+                }) + "\n")
+                written += 1
+            for fv in new_vulns:
+                out.write(json.dumps({
+                    "source": "trivy",
+                    "sbom_event": "vulnerability",
                     "host": HOSTNAME,
                     "image": image_tag,
                     "cve_id": fv.get("cve_id"),
@@ -189,12 +244,13 @@ def write_wazuh_events(result, image_tag):
                     "fixed_version": fv.get("fixed_version"),
                     "purl": fv.get("purl"),
                     "timestamp": ts,
-                }
-                out.write(json.dumps(event) + "\n")
+                }) + "\n")
                 written += 1
-    except PermissionError:
-        print(f"     wazuh log not writable ({WAZUH_JSONL})")
+    except OSError as e:
+        print(f"     wazuh log not writable ({WAZUH_JSONL}): {e}")
+        return written
     return written
+
 
 def generate_report(image_tag, db, out_dir):
     """Generate markdown vulnerability summary."""
@@ -241,7 +297,7 @@ def generate_report(image_tag, db, out_dir):
     lines.append("")
     lines.append("| Severity | Count |")
     lines.append("|----------|-------|")
-    for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"]:
+    for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "NONE", "UNKNOWN"]:
         count = severity_counts.get(sev, 0)
         if count > 0:
             lines.append(f"| {sev} | {count} |")
@@ -266,6 +322,7 @@ def generate_report(image_tag, db, out_dir):
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
+
 def discover_images():
     """List all images present on this host (not just running ones)."""
     cmd = ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"]
@@ -279,6 +336,7 @@ def discover_images():
             continue  # skip tooling images
         images.append(line)
     return sorted(set(images))
+
 
 def main():
     out_dir = "out"
@@ -313,9 +371,9 @@ def main():
             generate_report(image, db, out_dir)
             result["wazuh_sent"] = sent
             results.append(result)
-            print(f"     {result['components']} components  |  "
-                  f"{result['vulnerabilities']} vulns  |  "
-                  f"{result['new']} new  |  {sent} to wazuh")
+            print(f"     {result['components']} components ({result['new_components_count']} new)  |  "
+                  f"{result['vulnerabilities']} vulns ({result['new']} new)  |  "
+                  f"{sent} to wazuh")
         else:
             results.append({"image": image, "error": "scan failed"})
 
@@ -324,9 +382,10 @@ def main():
         if "error" in r:
             print(f"  x  {r['image']}  failed")
         else:
-            flag = "  *" if r["new"] > 0 else "   "
-            print(f"{flag} {r['image']}  {r['components']} comp, "
-                  f"{r['vulnerabilities']} vuln, {r['new']} new")
+            flag = "  *" if r["new"] > 0 or r["new_components_count"] > 0 else "   "
+            print(f"{flag} {r['image']}  {r['components']} comp ({r['new_components_count']} new), "
+                  f"{r['vulnerabilities']} vuln ({r['new']} new)")
+
 
 if __name__ == "__main__":
     main()
