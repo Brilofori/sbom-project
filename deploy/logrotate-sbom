@@ -1,0 +1,17 @@
+# Copy to /etc/logrotate.d/sbom
+#
+# Rotates by renaming the file and creating a new one ("create"), which the Wazuh agent
+# follows. Do NOT use copytruncate: truncating a monitored file fires Wazuh rule 592
+# "Log file size reduced" (level 8) on every rotation.
+/var/log/sbom/*.jsonl /var/log/sbom/*.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create
+    # If logrotate reports "insecure permissions" on /var/log/sbom, uncomment this and set
+    # it to the user and group that run the pipeline:
+    # su kojo kojo
+}

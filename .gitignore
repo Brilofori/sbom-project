@@ -1,8 +1,11 @@
 out/
 *.json
+!tests/fixtures/*.json
+*.partial
 .env
 __pycache__/
 *.pyc
+.pytest_cache/
 .venv/
 venv/
 *.bak

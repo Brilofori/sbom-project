@@ -1,4 +1,11 @@
-
+<!--
+  Wazuh rules for the SBOM pipeline's events (see README, "Wazuh events").
+  Install on the MANAGER:
+    sudo cp sbom_rules.xml /var/ossec/etc/rules/sbom_rules.xml
+    sudo chown wazuh:wazuh /var/ossec/etc/rules/sbom_rules.xml
+    sudo /var/ossec/bin/wazuh-analysisd -t        # syntax check
+    sudo systemctl restart wazuh-manager
+-->
 <group name="trivy,sbom,">
 
   <!-- Parent: any event our pipeline writes -->
@@ -8,7 +15,7 @@
     <description>Trivy SBOM event from $(image)</description>
   </rule>
 
-  <!-- Container package inventory -->
+  <!-- Package found in an image (baseline, newly added, or re-added) -->
   <rule id="100201" level="3">
     <if_sid>100200</if_sid>
     <field name="sbom_event">^component$</field>
@@ -16,7 +23,7 @@
     <group>sbom_inventory,</group>
   </rule>
 
-  <!-- Container vulnerability findings -->
+  <!-- New vulnerability (baseline, db_update, image_changed or regression: see $(cause)) -->
   <rule id="100202" level="5">
     <if_sid>100200</if_sid>
     <field name="sbom_event">^vulnerability$</field>
@@ -35,6 +42,30 @@
     <if_sid>100202</if_sid>
     <field name="severity">^critical$</field>
     <description>CRITICAL container vuln: $(cve_id) in $(package_name), $(image)</description>
+    <group>sbom_vulnerability,</group>
+  </rule>
+
+  <!-- Package version changed, e.g. a base image refresh or OS point release -->
+  <rule id="100205" level="3">
+    <if_sid>100200</if_sid>
+    <field name="sbom_event">^component_changed$</field>
+    <description>Container package changed: $(package_name) $(previous_version) to $(installed_version) in $(image)</description>
+    <group>sbom_inventory,</group>
+  </rule>
+
+  <!-- Package no longer in the image -->
+  <rule id="100206" level="3">
+    <if_sid>100200</if_sid>
+    <field name="sbom_event">^component_removed$</field>
+    <description>Container package removed: $(package_name) $(previous_version) from $(image)</description>
+    <group>sbom_inventory,</group>
+  </rule>
+
+  <!-- A previously reported vulnerability is no longer present (fixed or package removed) -->
+  <rule id="100207" level="3">
+    <if_sid>100200</if_sid>
+    <field name="sbom_event">^vulnerability_resolved$</field>
+    <description>Container vuln resolved: $(cve_id) in $(package_name), $(image)</description>
     <group>sbom_vulnerability,</group>
   </rule>
 

@@ -1,81 +1,80 @@
 #!/usr/bin/env python3
-"""Consolidated package-centric inventory across all scans.
-Answers: which package, which versions, which images, which hosts."""
+"""Package-centric inventory across the latest scan of every image on every host.
+Answers: which package, which versions, which images, which hosts.
 
+Usage:
+    python3 consolidated_report.py [OUTPUT.md]      default: out/consolidated_inventory.md
+
+For the same inventory as a single CycloneDX SBOM file, use export_cyclonedx.py.
+"""
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
-from pymongo import MongoClient
 
-def build_report(out_path="out/consolidated_inventory.md"):
-    db = MongoClient("mongodb://localhost:27017")["sweri_sbom"]
+from sbom_common import OUT_DIR, PACKAGE_TYPES, get_db, latest_scans
 
-    # For each image, use only its most recent scan
-    latest = {}
-    for scan in db["scans"].find().sort("scanned_at", 1):
-        latest[scan["image"]] = scan  # later scans overwrite earlier
 
-    # package name -> version -> set of (image, host)
+def build_report(scans):
+    # package name -> version -> {(image, host)}
     packages = defaultdict(lambda: defaultdict(set))
-    hosts = set()
-    image_count = 0
-
-    for image, scan in latest.items():
-        host = scan.get("host", "unknown")
+    hosts, images = set(), set()
+    for scan in scans:
+        host = scan.get("host") or "unknown"
         hosts.add(host)
-        image_count += 1
-        for c in scan.get("components", []):
-            name = c.get("name")
-            version = c.get("version") or "unknown"
-            if name:
-                packages[name][version].add((image, host))
+        images.add((scan["image"], host))
+        for c in scan.get("components") or []:
+            if c.get("type") not in PACKAGE_TYPES or not c.get("name"):
+                continue
+            packages[c["name"]][c.get("version") or "unknown"].add((scan["image"], host))
 
-    lines = []
-    lines.append("# Consolidated Package Inventory")
-    lines.append("")
-    lines.append(f"**Generated:** {datetime.now(timezone.utc).strftime('%d %B %Y, %H:%M UTC')}")
-    lines.append(f"**Images:** {image_count}")
-    lines.append(f"**Hosts:** {', '.join(sorted(hosts))}")
-    lines.append(f"**Unique packages:** {len(packages)}")
-    lines.append("")
+    lines = [
+        "# Consolidated Package Inventory",
+        "",
+        f"**Generated:** {datetime.now(timezone.utc).strftime('%d %B %Y, %H:%M UTC')}",
+        f"**Images:** {len(images)} (latest scan of each image on each host)",
+        f"**Hosts:** {', '.join(sorted(hosts)) or 'none'}",
+        f"**Unique packages:** {len(packages)}",
+        "",
+        "> Coverage: OS packages plus the language packages Trivy can read. Conda packages in "
+        "an image's base environment are not inventoried, so ML images may be missing their "
+        "Conda layer (see README, Known limitations).",
+        "",
+    ]
 
-    # Packages that exist in more than one version = the "which is good, which is bad" problem
+    # the same package at more than one version: the "which is good, which is bad" question
     multi_version = {n: v for n, v in packages.items() if len(v) > 1}
     if multi_version:
-        lines.append(f"## Packages With Multiple Versions Present ({len(multi_version)})")
-        lines.append("")
-        lines.append("These are the same package existing at different versions across the "
-                     "environment, the case worth reviewing first.")
-        lines.append("")
+        lines += [f"## Packages With Multiple Versions Present ({len(multi_version)})", "",
+                  "These are the same package at different versions across the environment, "
+                  "the case worth reviewing first.", ""]
         for name in sorted(multi_version):
-            versions = multi_version[name]
             lines.append(f"**{name}**")
-            for version in sorted(versions):
-                locations = sorted(versions[version])
-                loc_str = ", ".join(f"{img} on {host}" for img, host in locations)
-                lines.append(f"- `{version}` — {loc_str}")
+            for version in sorted(multi_version[name]):
+                where = ", ".join(f"{img} on {host}" for img, host in sorted(multi_version[name][version]))
+                lines.append(f"- `{version}` — {where}")
             lines.append("")
 
-    lines.append("## Full Package Inventory")
-    lines.append("")
-    lines.append("| Package | Version | Image | Host |")
-    lines.append("|---------|---------|-------|------|")
+    lines += ["## Full Package Inventory", "",
+              "| Package | Version | Image | Host |", "|---------|---------|-------|------|"]
     for name in sorted(packages):
         for version in sorted(packages[name]):
             for image, host in sorted(packages[name][version]):
                 lines.append(f"| {name} | {version} | {image} | {host} |")
+    lines += ["", "---", f"*Generated from {len(images)} images across {len(hosts)} host(s)*", ""]
+    return "\n".join(lines), len(packages), len(images), len(multi_version)
 
-    lines.append("")
-    lines.append("---")
-    lines.append(f"*Generated from {image_count} images across {len(hosts)} host(s)*")
 
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    out_path = argv[0] if argv else str(OUT_DIR / "consolidated_inventory.md")
+    text, n_packages, n_images, n_multi = build_report(latest_scans(get_db()))
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
+        f.write(text)
     print(f"Consolidated inventory written to {out_path}")
-    print(f"  {len(packages)} unique packages across {image_count} images")
-    print(f"  {len(multi_version)} packages have multiple versions present")
+    print(f"  {n_packages} unique packages across {n_images} images")
+    print(f"  {n_multi} packages have multiple versions present")
+    return 0
+
 
 if __name__ == "__main__":
-    out = sys.argv[1] if len(sys.argv) > 1 else "out/consolidated_inventory.md"
-    build_report(out)
+    sys.exit(main())

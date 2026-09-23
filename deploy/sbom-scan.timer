@@ -1,0 +1,12 @@
+# Copy to /etc/systemd/system/sbom-scan.timer (see sbom-scan.service for install steps).
+# Persistent=true runs a missed scan at boot if the machine was off or asleep at 02:30.
+[Unit]
+Description=Nightly container SBOM scan
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
