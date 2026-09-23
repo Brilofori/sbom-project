@@ -1,0 +1,19 @@
+# Copy to /etc/systemd/system/sbom-scan.service (with sbom-scan.timer), then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now sbom-scan.timer
+# Run once by hand:   sudo systemctl start sbom-scan.service
+# Logs:               journalctl -u sbom-scan.service
+[Unit]
+Description=Container SBOM scan (Trivy -> MongoDB -> Wazuh)
+Wants=docker.service network-online.target
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+# Change these three lines for the host. The user must be in the docker group and own
+# /var/log/sbom (see README, Setup).
+User=kojo
+WorkingDirectory=/home/kojo/sbom-project
+ExecStart=/usr/bin/python3 -u /home/kojo/sbom-project/scan_all.py
+# Optional settings (README, Configuration), e.g.:
+# Environment=SBOM_TRIVY_IMAGE=aquasec/trivy@sha256:...
+TimeoutStartSec=4h

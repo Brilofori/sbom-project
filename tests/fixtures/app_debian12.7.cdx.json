@@ -1,0 +1,584 @@
+{
+  "$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json",
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "serialNumber": "urn:uuid:00000000-0000-4000-8000-111111111111",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-09-20T02:30:00+00:00",
+    "tools": {
+      "components": [
+        {
+          "type": "application",
+          "manufacturer": {
+            "name": "Aqua Security Software Ltd."
+          },
+          "group": "aquasecurity",
+          "name": "trivy",
+          "version": "0.74.0"
+        }
+      ]
+    },
+    "component": {
+      "bom-ref": "pkg:oci/app@sha256%3A11111111?arch=amd64&repository_url=index.docker.io%2Fexample%2Fapp",
+      "type": "container",
+      "name": "example/app:1.0",
+      "purl": "pkg:oci/app@sha256%3A11111111?arch=amd64&repository_url=index.docker.io%2Fexample%2Fapp",
+      "properties": [
+        {
+          "name": "aquasecurity:trivy:ImageID",
+          "value": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        {
+          "name": "aquasecurity:trivy:RepoDigest",
+          "value": "example/app@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        {
+          "name": "aquasecurity:trivy:RepoTag",
+          "value": "example/app:1.0"
+        },
+        {
+          "name": "aquasecurity:trivy:SchemaVersion",
+          "value": "2"
+        }
+      ]
+    }
+  },
+  "components": [
+    {
+      "bom-ref": "os-12.7",
+      "type": "operating-system",
+      "name": "debian",
+      "version": "12.7",
+      "properties": [
+        {
+          "name": "aquasecurity:trivy:Class",
+          "value": "os-pkgs"
+        },
+        {
+          "name": "aquasecurity:trivy:Type",
+          "value": "debian"
+        }
+      ]
+    },
+    {
+      "bom-ref": "app-python",
+      "type": "application",
+      "name": "usr/local/lib/python3.11/site-packages",
+      "properties": [
+        {
+          "name": "aquasecurity:trivy:Class",
+          "value": "lang-pkgs"
+        },
+        {
+          "name": "aquasecurity:trivy:Type",
+          "value": "python-pkg"
+        }
+      ]
+    },
+    {
+      "bom-ref": "app-jar",
+      "type": "application",
+      "name": "opt/app/app.jar",
+      "properties": [
+        {
+          "name": "aquasecurity:trivy:Class",
+          "value": "lang-pkgs"
+        },
+        {
+          "name": "aquasecurity:trivy:Type",
+          "value": "jar"
+        }
+      ]
+    },
+    {
+      "bom-ref": "pkg:deb/debian/bash@5.2.15-2+b7?arch=amd64&distro=debian-12.7",
+      "type": "library",
+      "name": "bash",
+      "version": "5.2.15-2+b7",
+      "purl": "pkg:deb/debian/bash@5.2.15-2+b7?arch=amd64&distro=debian-12.7",
+      "properties": [
+        {
+          "name": "aquasecurity:trivy:PkgType",
+          "value": "debian"
+        },
+        {
+          "name": "aquasecurity:trivy:SrcName",
+          "value": "bash"
+        }
+      ]
+    },
+    {
+      "bom-ref": "pkg:deb/debian/libc6@2.36-9+deb12u7?arch=amd64&distro=debian-12.7",
+      "type": "library",
+      "name": "libc6",
+      "version": "2.36-9+deb12u7",
+      "purl": "pkg:deb/debian/libc6@2.36-9+deb12u7?arch=amd64&distro=debian-12.7",
+      "properties": [
+        {
+          "name": "aquasecurity:trivy:PkgType",
+          "value": "debian"
+        },
+        {
+          "name": "aquasecurity:trivy:SrcName",
+          "value": "libc6"
+        }
+      ]
+    },
+    {
+      "bom-ref": "pkg:deb/debian/libssl3@3.0.14-1~deb12u2?arch=amd64&distro=debian-12.7",
+      "type": "library",
+      "name": "libssl3",
+      "version": "3.0.14-1~deb12u2",
+      "purl": "pkg:deb/debian/libssl3@3.0.14-1~deb12u2?arch=amd64&distro=debian-12.7",
+      "properties": [
+        {
+          "name": "aquasecurity:trivy:PkgType",
+          "value": "debian"
+        },
+        {
+          "name": "aquasecurity:trivy:SrcName",
+          "value": "libssl3"
+        }
+      ]
+    },
+    {
+      "bom-ref": "pkg:deb/debian/openssl@3.0.14-1~deb12u2?arch=amd64&distro=debian-12.7",
+      "type": "library",
+      "name": "openssl",
+      "version": "3.0.14-1~deb12u2",
+      "purl": "pkg:deb/debian/openssl@3.0.14-1~deb12u2?arch=amd64&distro=debian-12.7",
+      "properties": [
+        {
+          "name": "aquasecurity:trivy:PkgType",
+          "value": "debian"
+        },
+        {
+          "name": "aquasecurity:trivy:SrcName",
+          "value": "openssl"
+        }
+      ]
+    },
+    {
+      "bom-ref": "pkg:deb/debian/zlib1g@1:1.2.13.dfsg-1?arch=amd64&distro=debian-12.7",
+      "type": "library",
+      "name": "zlib1g",
+      "version": "1:1.2.13.dfsg-1",
+      "purl": "pkg:deb/debian/zlib1g@1:1.2.13.dfsg-1?arch=amd64&distro=debian-12.7",
+      "properties": [
+        {
+          "name": "aquasecurity:trivy:PkgType",
+          "value": "debian"
+        },
+        {
+          "name": "aquasecurity:trivy:SrcName",
+          "value": "zlib1g"
+        }
+      ]
+    },
+    {
+      "bom-ref": "pkg:pypi/pip@24.0",
+      "type": "library",
+      "name": "pip",
+      "version": "24.0",
+      "purl": "pkg:pypi/pip@24.0"
+    },
+    {
+      "bom-ref": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.9.10.3",
+      "type": "library",
+      "group": "com.fasterxml.jackson.core",
+      "name": "jackson-databind",
+      "version": "2.9.10.3",
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.9.10.3"
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "pkg:oci/app@sha256%3A11111111?arch=amd64&repository_url=index.docker.io%2Fexample%2Fapp",
+      "dependsOn": [
+        "os-12.7",
+        "app-python",
+        "app-jar"
+      ]
+    },
+    {
+      "ref": "os-12.7",
+      "dependsOn": [
+        "pkg:deb/debian/bash@5.2.15-2+b7?arch=amd64&distro=debian-12.7",
+        "pkg:deb/debian/libc6@2.36-9+deb12u7?arch=amd64&distro=debian-12.7",
+        "pkg:deb/debian/libssl3@3.0.14-1~deb12u2?arch=amd64&distro=debian-12.7",
+        "pkg:deb/debian/openssl@3.0.14-1~deb12u2?arch=amd64&distro=debian-12.7",
+        "pkg:deb/debian/zlib1g@1:1.2.13.dfsg-1?arch=amd64&distro=debian-12.7"
+      ]
+    },
+    {
+      "ref": "app-python",
+      "dependsOn": [
+        "pkg:pypi/pip@24.0"
+      ]
+    },
+    {
+      "ref": "app-jar",
+      "dependsOn": [
+        "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.9.10.3"
+      ]
+    },
+    {
+      "ref": "pkg:deb/debian/bash@5.2.15-2+b7?arch=amd64&distro=debian-12.7",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:deb/debian/libc6@2.36-9+deb12u7?arch=amd64&distro=debian-12.7",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:deb/debian/libssl3@3.0.14-1~deb12u2?arch=amd64&distro=debian-12.7",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:deb/debian/openssl@3.0.14-1~deb12u2?arch=amd64&distro=debian-12.7",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:deb/debian/zlib1g@1:1.2.13.dfsg-1?arch=amd64&distro=debian-12.7",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/pip@24.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.9.10.3",
+      "dependsOn": []
+    }
+  ],
+  "vulnerabilities": [
+    {
+      "id": "CVE-2019-18276",
+      "source": {
+        "name": "debian",
+        "url": "https://example.invalid/debian"
+      },
+      "ratings": [
+        {
+          "source": {
+            "name": "cbl-mariner"
+          },
+          "severity": "high"
+        },
+        {
+          "source": {
+            "name": "debian"
+          },
+          "severity": "low"
+        },
+        {
+          "source": {
+            "name": "nvd"
+          },
+          "severity": "high",
+          "method": "CVSSv2",
+          "score": 7.2,
+          "vector": "AV:N/AC:L/Au:N/C:P/I:P/A:P"
+        },
+        {
+          "source": {
+            "name": "nvd"
+          },
+          "severity": "high",
+          "method": "CVSSv31",
+          "score": 7.8,
+          "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+        },
+        {
+          "source": {
+            "name": "photon"
+          },
+          "severity": "high"
+        },
+        {
+          "source": {
+            "name": "ubuntu"
+          },
+          "severity": "low"
+        }
+      ],
+      "cwes": [
+        20
+      ],
+      "description": "Test description for CVE-2019-18276.",
+      "advisories": [
+        {
+          "url": "https://avd.aquasec.com/nvd/cve-2019-18276"
+        }
+      ],
+      "published": "2024-01-01T00:00:00+00:00",
+      "updated": "2024-06-01T00:00:00+00:00",
+      "affects": [
+        {
+          "ref": "pkg:deb/debian/bash@5.2.15-2+b7?arch=amd64&distro=debian-12.7",
+          "versions": [
+            {
+              "version": "5.2.15-2+b7",
+              "status": "affected"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "CVE-2020-9548",
+      "source": {
+        "name": "ghsa",
+        "url": "https://example.invalid/ghsa"
+      },
+      "ratings": [
+        {
+          "source": {
+            "name": "ghsa"
+          },
+          "severity": "critical"
+        },
+        {
+          "source": {
+            "name": "nvd"
+          },
+          "severity": "medium",
+          "method": "CVSSv2",
+          "score": 6.8,
+          "vector": "AV:N/AC:L/Au:N/C:P/I:P/A:P"
+        },
+        {
+          "source": {
+            "name": "nvd"
+          },
+          "severity": "critical",
+          "method": "CVSSv31",
+          "score": 9.8,
+          "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+        }
+      ],
+      "cwes": [
+        20
+      ],
+      "description": "Test description for CVE-2020-9548.",
+      "advisories": [
+        {
+          "url": "https://avd.aquasec.com/nvd/cve-2020-9548"
+        }
+      ],
+      "published": "2024-01-01T00:00:00+00:00",
+      "updated": "2024-06-01T00:00:00+00:00",
+      "affects": [
+        {
+          "ref": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.9.10.3",
+          "versions": [
+            {
+              "version": "2.9.10.3",
+              "status": "affected"
+            }
+          ]
+        }
+      ],
+      "recommendation": "Upgrade com.fasterxml.jackson.core:jackson-databind to version 2.9.10.4"
+    },
+    {
+      "id": "CVE-2023-45853",
+      "source": {
+        "name": "debian",
+        "url": "https://example.invalid/debian"
+      },
+      "ratings": [
+        {
+          "source": {
+            "name": "nvd"
+          },
+          "severity": "critical",
+          "method": "CVSSv31",
+          "score": 9.8,
+          "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+        }
+      ],
+      "cwes": [
+        20
+      ],
+      "description": "Test description for CVE-2023-45853.",
+      "advisories": [
+        {
+          "url": "https://avd.aquasec.com/nvd/cve-2023-45853"
+        }
+      ],
+      "published": "2024-01-01T00:00:00+00:00",
+      "updated": "2024-06-01T00:00:00+00:00",
+      "affects": [
+        {
+          "ref": "pkg:deb/debian/zlib1g@1:1.2.13.dfsg-1?arch=amd64&distro=debian-12.7",
+          "versions": [
+            {
+              "version": "1:1.2.13.dfsg-1",
+              "status": "affected"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "CVE-2023-5752",
+      "source": {
+        "name": "ghsa",
+        "url": "https://example.invalid/ghsa"
+      },
+      "ratings": [
+        {
+          "source": {
+            "name": "ghsa"
+          },
+          "severity": "low"
+        },
+        {
+          "source": {
+            "name": "nvd"
+          },
+          "severity": "medium",
+          "method": "CVSSv31",
+          "score": 5.5,
+          "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+        }
+      ],
+      "cwes": [
+        20
+      ],
+      "description": "Test description for CVE-2023-5752.",
+      "advisories": [
+        {
+          "url": "https://avd.aquasec.com/nvd/cve-2023-5752"
+        }
+      ],
+      "published": "2024-01-01T00:00:00+00:00",
+      "updated": "2024-06-01T00:00:00+00:00",
+      "affects": [
+        {
+          "ref": "pkg:pypi/pip@24.0",
+          "versions": [
+            {
+              "version": "24.0",
+              "status": "affected"
+            }
+          ]
+        }
+      ],
+      "recommendation": "Upgrade pip to version 23.3"
+    },
+    {
+      "id": "CVE-2024-5535",
+      "source": {
+        "name": "debian",
+        "url": "https://example.invalid/debian"
+      },
+      "ratings": [
+        {
+          "source": {
+            "name": "debian"
+          },
+          "severity": "high"
+        },
+        {
+          "source": {
+            "name": "nvd"
+          },
+          "severity": "critical",
+          "method": "CVSSv31",
+          "score": 9.1,
+          "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+        },
+        {
+          "source": {
+            "name": "redhat"
+          },
+          "severity": "low",
+          "method": "CVSSv31",
+          "score": 3.7,
+          "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+        }
+      ],
+      "cwes": [
+        20
+      ],
+      "description": "Test description for CVE-2024-5535.",
+      "advisories": [
+        {
+          "url": "https://avd.aquasec.com/nvd/cve-2024-5535"
+        }
+      ],
+      "published": "2024-01-01T00:00:00+00:00",
+      "updated": "2024-06-01T00:00:00+00:00",
+      "affects": [
+        {
+          "ref": "pkg:deb/debian/libssl3@3.0.14-1~deb12u2?arch=amd64&distro=debian-12.7",
+          "versions": [
+            {
+              "version": "3.0.14-1~deb12u2",
+              "status": "affected"
+            }
+          ]
+        },
+        {
+          "ref": "pkg:deb/debian/openssl@3.0.14-1~deb12u2?arch=amd64&distro=debian-12.7",
+          "versions": [
+            {
+              "version": "3.0.14-1~deb12u2",
+              "status": "affected"
+            }
+          ]
+        }
+      ],
+      "recommendation": "Upgrade libssl3 to version 3.0.15-1~deb12u1; Upgrade openssl to version 3.0.15-1~deb12u1"
+    },
+    {
+      "id": "CVE-2025-0395",
+      "source": {
+        "name": "debian",
+        "url": "https://example.invalid/debian"
+      },
+      "ratings": [
+        {
+          "source": {
+            "name": "debian"
+          },
+          "severity": "medium"
+        },
+        {
+          "source": {
+            "name": "nvd"
+          },
+          "severity": "high",
+          "method": "CVSSv31",
+          "score": 7.5,
+          "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+        }
+      ],
+      "cwes": [
+        20
+      ],
+      "description": "Test description for CVE-2025-0395.",
+      "advisories": [
+        {
+          "url": "https://avd.aquasec.com/nvd/cve-2025-0395"
+        }
+      ],
+      "published": "2024-01-01T00:00:00+00:00",
+      "updated": "2024-06-01T00:00:00+00:00",
+      "affects": [
+        {
+          "ref": "pkg:deb/debian/libc6@2.36-9+deb12u7?arch=amd64&distro=debian-12.7",
+          "versions": [
+            {
+              "version": "2.36-9+deb12u7",
+              "status": "affected"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

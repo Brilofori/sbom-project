@@ -1,6 +1,10 @@
-<!-- Add this inside <ossec_config> in the agent's /var/ossec/etc/ossec.conf -->
-<!-- Tells the Wazuh agent to read Trivy SBOM events and forward them to the manager -->
+<!-- Add this inside <ossec_config> in the AGENT's /var/ossec/etc/ossec.conf, then
+     sudo systemctl restart wazuh-agent
+     It tells the agent to read the pipeline's events and forward them to the manager.
+     only-future-events=no makes the agent also read lines written while it was stopped
+     or restarting (the default, yes, silently skips them). -->
 <localfile>
   <log_format>json</log_format>
   <location>/var/log/sbom/trivy-findings.jsonl</location>
+  <only-future-events>no</only-future-events>
 </localfile>

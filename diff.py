@@ -1,82 +1,89 @@
-from pymongo import MongoClient
+#!/usr/bin/env python3
+"""Compare package inventories.
 
-def get_components(image_tag):
-    client = MongoClient("mongodb://localhost:27017")
-    db = client["sweri_sbom"]
-    doc = db["scans"].find_one({"image": image_tag}, sort=[("scanned_at", -1)])
-    if not doc:
-        raise ValueError(f"No scan found for {image_tag}")
+Usage:
+    python3 diff.py IMAGE              what changed between the last two scans of IMAGE
+    python3 diff.py IMAGE_A IMAGE_B    latest scan of IMAGE_A vs latest scan of IMAGE_B
+    --host HOST                        only use scans from this host
 
-    keyed = {}
-    for c in doc["components"]:
-        key = c["purl"] if c["purl"] else f"{c['type']}:{c['name']}"
-        keyed[key] = c
-    return keyed
+Packages are matched on identity (the purl without version and qualifiers, e.g.
+pkg:deb/debian/libc6), so a version bump shows as "changed", not as removed + added,
+and a package only matches the same package from the same ecosystem.
+"""
+import argparse
+import sys
 
-def diff(image_a, image_b):
-    a = get_components(image_a)
-    b = get_components(image_b)
+from sbom_common import PACKAGE_TYPES, get_db, identity, latest_scan
 
-    # group by name first, this is the primary match key
-    a_by_name = {}
-    for k, c in a.items():
-        a_by_name.setdefault(c["name"], []).append(c)
-    b_by_name = {}
-    for k, c in b.items():
-        b_by_name.setdefault(c["name"], []).append(c)
 
-    # names in both scans: these are either unchanged or version-changed
-    # names in only one scan: these are genuinely added or removed
-    names_in_both = set(a_by_name) & set(b_by_name)
-    names_only_in_a = set(a_by_name) - set(b_by_name)
-    names_only_in_b = set(b_by_name) - set(a_by_name)
+def packages(scan):
+    out = {}
+    for c in scan.get("components") or []:
+        if c.get("type") not in PACKAGE_TYPES or not c.get("name"):
+            continue
+        entry = out.setdefault(identity(c.get("purl"), c.get("type"), c.get("name")),
+                               {"name": c["name"], "type": c.get("type"), "versions": set()})
+        entry["versions"].add(c.get("version") or "")
+    return out
 
-    # genuinely removed: the package name doesn't exist at all in scan b
-    removed = []
-    for name in sorted(names_only_in_a):
-        for c in a_by_name[name]:
-            removed.append(c)
 
-    # genuinely added: the package name doesn't exist at all in scan a
-    added = []
-    for name in sorted(names_only_in_b):
-        for c in b_by_name[name]:
-            added.append(c)
+def diff_scans(scan_a, scan_b):
+    a, b = packages(scan_a), packages(scan_b)
+    changed, unchanged = [], 0
+    for key in sorted(a.keys() & b.keys()):
+        if a[key]["versions"] == b[key]["versions"]:
+            unchanged += 1
+        else:
+            changed.append({"name": a[key]["name"], "type": a[key]["type"],
+                            "old_versions": sorted(a[key]["versions"]),
+                            "new_versions": sorted(b[key]["versions"])})
+    return {"added": [b[k] for k in sorted(b.keys() - a.keys())],
+            "removed": [a[k] for k in sorted(a.keys() - b.keys())],
+            "changed": changed,
+            "unchanged_count": unchanged}
 
-    # version changed: name exists in both, but versions differ
-    changed = []
-    for name in sorted(names_in_both):
-        a_versions = {c["version"] for c in a_by_name[name]}
-        b_versions = {c["version"] for c in b_by_name[name]}
-        if a_versions != b_versions:
-            changed.append({
-                "name": name,
-                "old_versions": sorted(a_versions),
-                "new_versions": sorted(b_versions),
-            })
 
-    print(f"\n=== Diff: {image_a}  ->  {image_b} ===\n")
+def print_diff(label_a, label_b, result):
+    print(f"\n=== Diff: {label_a}  ->  {label_b} ===\n")
+    for title, sign, key in (("Added", "+", "added"), ("Removed", "-", "removed")):
+        print(f"{title} ({len(result[key])}):")
+        for c in sorted(result[key], key=lambda c: c["name"]):
+            print(f"  {sign} {c['name']} {', '.join(sorted(c['versions']))}  [{c['type']}]")
+        print()
+    print(f"Version changed ({len(result['changed'])}):")
+    for e in sorted(result["changed"], key=lambda e: e["name"]):
+        print(f"  ~ {e['name']}: {', '.join(e['old_versions'])} -> {', '.join(e['new_versions'])}")
+    print(f"\nUnchanged: {result['unchanged_count']}")
 
-    print(f"Added ({len(added)}):")
-    for c in sorted(added, key=lambda c: c["name"]):
-        print(f"  + {c['name']} {c['version']}  [{c['type']}]")
 
-    print(f"\nRemoved ({len(removed)}):")
-    for c in sorted(removed, key=lambda c: c["name"]):
-        print(f"  - {c['name']} {c['version']}  [{c['type']}]")
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Compare package inventories between scans.")
+    ap.add_argument("image_a")
+    ap.add_argument("image_b", nargs="?", help="omit to compare IMAGE_A's last two scans")
+    ap.add_argument("--host", help="only use scans from this host")
+    args = ap.parse_args(argv)
+    db = get_db()
 
-    print(f"\nVersion changed ({len(changed)}):")
-    for entry in changed:
-        print(f"  ~ {entry['name']}: {entry['old_versions']} -> {entry['new_versions']}")
+    if args.image_b:
+        a = latest_scan(db, args.image_a, args.host)
+        b = latest_scan(db, args.image_b, args.host)
+        labels = (args.image_a, args.image_b)
+        missing = [img for img, scan in ((args.image_a, a), (args.image_b, b)) if not scan]
+        if missing:
+            print(f"No scan found for {', '.join(missing)}")
+            return 1
+    else:
+        b = latest_scan(db, args.image_a, args.host)
+        a = latest_scan(db, args.image_a, args.host, skip=1)
+        if not a:
+            print(f"Need at least two scans of {args.image_a} to compare")
+            return 1
+        labels = tuple(f"{args.image_a} ({s['scanned_at']:%Y-%m-%d %H:%M})" for s in (a, b))
 
-    print(f"\nUnchanged: {len(names_in_both) - len(changed)}")
+    result = diff_scans(a, b)
+    print_diff(*labels, result)
+    return 0
 
-    return {
-        "added": added,
-        "removed": removed,
-        "changed": changed,
-        "unchanged_count": len(names_in_both) - len(changed),
-    }
 
 if __name__ == "__main__":
-    diff("python:3.9-slim", "python:3.11-slim")
+    sys.exit(main())
