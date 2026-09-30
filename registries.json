@@ -1,0 +1,21 @@
+{
+  "registry": "docker.io",
+  "platform": "linux/amd64",
+  "repositories": [
+    {
+      "repo": "redis",
+      "include": "^7\\.\\d+\\.\\d+-alpine$",
+      "limit": 5
+    },
+    {
+      "repo": "python",
+      "include": "^3\\.\\d+\\.\\d+-slim$",
+      "limit": 5
+    },
+    {
+      "repo": "ollama/ollama",
+      "include": "^\\d+\\.\\d+\\.\\d+$",
+      "limit": 2
+    }
+  ]
+}

@@ -1,8 +1,15 @@
 # Container SBOM pipeline
 
-Builds a software bill of materials (SBOM) for every Docker image on a host, tracks what
-changes between scans, and puts the container inventory and its vulnerabilities into
-Wazuh next to the host inventory that Syscollector already collects.
+Builds a software bill of materials (SBOM) for container images, tracks what changes
+between scans, and puts the container inventory and its vulnerabilities into Wazuh next to
+the host inventory that Syscollector already collects.
+
+It runs in two modes that share the same Trivy pin, event format and Wazuh rules:
+
+- **Registry mode** (`scan_registry.py`): lists tags in container registries, pulls each
+  image once, scans it, sends the findings to Wazuh and deletes the image. Runs hourly.
+  See [Registry mode](#registry-mode).
+- **Host mode** (`scan_all.py`): scans the images already on a host. Runs nightly.
 
 Built for SWERI's Software Supply Chain Security placement (INFO3017, Group 8, 2026).
 
@@ -16,7 +23,7 @@ docker images ──► Trivy (pinned, cached DB) ──► out/<image>.json   C
    /var/log/sbom/trivy-findings.jsonl                                 MongoDB  sweri_sbom
                   │  Wazuh agent (localfile)                                         │
                   ▼                                                                  ▼
-   Wazuh manager, rules 100200-100207 ──► dashboard       reports, consolidated SBOM, diffs
+   Wazuh manager, rules 100200-100207 ──► dashboard       reports, consolidated SBOM
 ```
 
 Wazuh only receives changes. A nightly scan sends nothing unless something changed:
@@ -27,16 +34,16 @@ inventory once (the *baseline*).
 
 | File | Purpose |
 |---|---|
-| `scan_all.py` | The pipeline. Scans images, tracks changes, feeds Wazuh, writes per-image reports |
+| `scan_registry.py` | Registry mode. Pulls, scans and removes registry images one at a time, feeds Wazuh |
+| `registries.json` | Registry mode config: which repos and tags to scan |
+| `scan_all.py` | Host mode. Scans the images on a host, tracks changes, feeds Wazuh, writes per-image reports |
 | `report.py` | Markdown vulnerability summary for one image |
-| `consolidated_report.py` | Markdown inventory across all images and hosts: which package, which version, where |
 | `export_cyclonedx.py` | One consolidated CycloneDX SBOM file for every scanned image (deliverable 3) |
-| `diff.py` | What changed between two scans of an image, or between two images |
 | `gap_analysis.py` | Wazuh Syscollector (host) vs Trivy (container) inventory comparison (deliverable 4) |
 | `sbom_common.py` | Shared settings and helpers |
 | `wazuh/sbom_rules.xml` | Manager rules for the pipeline's events |
 | `wazuh/agent_localfile_block.xml` | Agent config that reads the event log |
-| `deploy/` | systemd timer and service for nightly runs; logrotate config |
+| `deploy/` | systemd units (`sbom-registry.*` hourly, `sbom-scan.*` nightly); logrotate config |
 | `inventory.txt` | Optional fixed list of images to scan |
 | `tests/` | Unit tests (`python3 -m pytest`) |
 
@@ -129,15 +136,68 @@ Each run does the following:
 Other tools:
 ```bash
 python3 report.py python:3.11-slim [out.md]         # vulnerability summary for one image
-python3 consolidated_report.py                      # out/consolidated_inventory.md
 python3 export_cyclonedx.py                         # out/sweri-consolidated.cdx.json
-python3 diff.py python:3.11-slim                    # what changed between its last two scans
-python3 diff.py python:3.9-slim python:3.11-slim    # compare two images
 python3 gap_analysis.py wazuh_inventory.txt --image python:3.9-slim
 ```
 For `gap_analysis.py`, first export the host inventory on the Wazuh manager. Agent `001` is
 the scanned host; the command is also in the script's header.
 `sudo sqlite3 /var/ossec/queue/db/001.db "SELECT name, version FROM sys_programs;" > wazuh_inventory.txt`
+
+## Registry mode
+
+`scan_registry.py` scans images straight from container registries, so the scanning host
+doesn't need to keep them. Each pass:
+
+1. Lists the tags of every repo in `registries.json` that match its filters, with the digest
+   each tag points to.
+2. Skips any image + tag + digest already scanned. A tag is scanned again only when it is
+   rebuilt (new digest).
+3. For each new image: pull, scan with Trivy, write the changes to the Wazuh event log,
+   record it in MongoDB, then remove the image. Only one image is on disk at a time, so the
+   host needs free space for the largest image plus Trivy's scratch space (about twice the
+   image size).
+
+Images that were already on the host before the pass are never removed. An image that fails
+is retried on the next pass, up to 3 times.
+
+```bash
+python3 scan_registry.py --dry-run      # list what would be scanned, pull nothing
+python3 scan_registry.py                # one pass
+```
+
+**Config.** Each entry in `registries.json` names a repo and which of its tags to scan:
+```json
+{"repo": "python", "include": "^3\\.\\d+\\.\\d+-slim$", "limit": 5, "platform": "linux/amd64"}
+```
+`include` and `exclude` are regular expressions on the tag, `limit` keeps the newest N
+matching tags. Docker Hub is the only registry type supported so far. Any registry that
+speaks the Docker Registry v2 API (Harbor, GHCR, ECR, a private `registry:2`) can be added
+with a tag-listing function and credentials; pull, scan and ship stay the same. Anonymous
+Docker Hub pulls are rate-limited, so run `docker login` with a free account on the
+scanning host.
+
+**Schedule.** Setup steps 1 to 6 apply here too. Then:
+```bash
+sudo cp deploy/sbom-registry.service deploy/sbom-registry.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now sbom-registry.timer
+systemctl list-timers sbom-registry.timer
+tail -f /var/log/sbom/registry.log
+```
+The timer runs 5 minutes after boot, then hourly. Only one pass runs at a time.
+
+**Events.** Same format and rules as host mode, plus `scanner_mode: "registry"`,
+`registry` and `digest`. In the Wazuh dashboard, `data.scanner_mode:registry` shows only
+registry-mode events; add `and data.sbom_event:component` for one row per package per image.
+
+**State.** Change tracking is kept apart from host mode, in `registry_scans` (one document
+per image + tag + digest, with its attempt count), `registry_component_state` and
+`registry_vuln_state`. Each scan is also saved to `scans` with `scanner_mode: "registry"`,
+and its CycloneDX file stays in `out/registry/`, so `report.py`, `export_cyclonedx.py` and
+`gap_analysis.py` work on registry images too.
+
+**Limitation.** An image is scanned once per digest. A CVE published after that scan is not
+reported until the tag is rebuilt. Host mode catches these on its nightly re-scan
+(`cause: db_update`); registry mode doesn't yet.
 
 ## How change detection works
 
@@ -286,5 +346,5 @@ The tests use fixtures shaped like Trivy 0.74's CycloneDX output and an in-memor
 - parsing, including fixed versions and severity selection;
 - every change-tracking case (point-release rebuild, fix, removal, regression, new DB data,
   multiple hosts, failed delivery, legacy migration);
-- reports, diffs, and schema validation of the consolidated SBOM (when
+- reports, the gap analysis, and schema validation of the consolidated SBOM (when
   `cyclonedx-python-lib[json-validation]` is installed).

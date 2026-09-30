@@ -2,8 +2,6 @@ import json
 
 import pytest
 
-import consolidated_report
-import diff
 import export_cyclonedx
 import gap_analysis
 import report
@@ -40,25 +38,6 @@ def test_latest_scans_is_per_host_and_image(db, wazuh_log):
     run(db, F127, wazuh_log, 2, host="b")
     latest = {(s["host"], s["image_id"][-1]) for s in latest_scans(db)}
     assert latest == {("a", "2"), ("b", "1")}
-
-
-def test_consolidated_inventory(db, wazuh_log):
-    run(db, F127, wazuh_log, 0, image="app:12.7")
-    run(db, F128, wazuh_log, 1, image="app:12.8")
-    text, _, n_images, n_multi = consolidated_report.build_report(latest_scans(db))
-    assert (n_images, n_multi) == (2, 4)  # debian, libc6, libssl3, openssl at two versions
-    assert "- `2.36-9+deb12u7` — app:12.7 on node-01" in text
-    assert "site-packages" not in text    # application groupings are not packages
-
-
-def test_diff_last_two_scans_of_one_image(db, wazuh_log):
-    run(db, F127, wazuh_log, 0)
-    run(db, F128, wazuh_log, 1)
-    r = diff.diff_scans(latest_scan(db, IMG, skip=1), latest_scan(db, IMG))
-    assert sorted(c["name"] for c in r["changed"]) == ["debian", "libc6", "libssl3", "openssl"]
-    assert [c["name"] for c in r["added"]] == ["curl"]
-    assert [c["name"] for c in r["removed"]] == ["zlib1g"]
-    assert r["unchanged_count"] == 3
 
 
 def _merged():

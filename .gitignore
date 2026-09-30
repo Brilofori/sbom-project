@@ -1,6 +1,7 @@
 out/
 *.json
 !tests/fixtures/*.json
+!registries.json
 *.partial
 .env
 __pycache__/
@@ -11,3 +12,4 @@ venv/
 *.bak
 *.swp
 demo_inventory.txt
+*.patch
