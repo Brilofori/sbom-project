@@ -1,0 +1,12 @@
+[Unit]
+Description=SWERI SBOM registry scanner (one pass)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=kojo
+WorkingDirectory=/home/kojo/sbom-project
+ExecStart=/usr/bin/python3 scan_registry.py
+StandardOutput=append:/var/log/sbom/registry.log
+StandardError=append:/var/log/sbom/registry.log
