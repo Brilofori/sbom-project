@@ -141,3 +141,35 @@ def test_unwritable_out_dir_stops_before_scanning(tmp_path):
     with pytest.raises(SystemExit) as e:
         scan_all.check_out_dir(blocker / "out")
     assert "sudo chown -R" in str(e.value)
+
+
+def test_offline_never_downloads_the_db_and_scans_offline(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[-3:] == ["version", "--format", "json"]:
+            return Result(stdout=json.dumps({"Version": "0.74.0", "VulnerabilityDB": {
+                "UpdatedAt": "2026-09-30T00:00:00Z"}}))
+        (tmp_path / "python_3.11-slim.json.partial").write_text("{}")
+        return Result()
+
+    monkeypatch.setattr(scan_all, "OFFLINE", True)
+    monkeypatch.setattr(scan_all.subprocess, "run", fake_run)
+    assert scan_all.prepare_trivy() == ("0.74.0", "2026-09-30T00:00:00Z", True)
+    assert not any("--download-db-only" in c for c in calls)
+    scan_all.scan_image("python:3.11-slim", tmp_path, skip_db_update=True)
+    assert {"--skip-db-update", "--skip-java-db-update", "--offline-scan"} <= set(calls[-1])
+
+
+def test_offline_without_a_cached_db_stops_with_instructions(monkeypatch, tmp_path):
+    monkeypatch.setattr(scan_all, "OFFLINE", True)
+    monkeypatch.setattr(scan_all, "OUT_DIR", tmp_path)
+    monkeypatch.setattr(scan_all, "discover_images", lambda: ["python:3.11-slim"])
+    monkeypatch.setattr(scan_all, "check_wazuh_log", lambda path: None)
+    monkeypatch.setattr(scan_all, "get_db", lambda: __import__("mongomock").MongoClient().db)
+    monkeypatch.setattr(scan_all.subprocess, "run",
+                        lambda cmd, **k: Result(stdout=json.dumps({"Version": "0.74.0"})))
+    with pytest.raises(SystemExit) as e:
+        scan_all.main([])
+    assert "no Trivy vulnerability DB" in str(e.value)

@@ -58,6 +58,7 @@ OUT_DIR = "out/registry"
 MAX_ATTEMPTS = 3          # give up on an image after this many failed passes
 SCAN_TIMEOUT = 3600       # seconds; large images take a while
 PULL_TIMEOUT = 3600
+OFFLINE = os.environ.get("SBOM_TRIVY_OFFLINE", "").strip().lower() in ("1", "true", "yes")
 WRITE_BATCH = 400         # lines written before pausing, so the Wazuh agent buffer keeps up
 
 # Use the same pinned Trivy as scan_all.py when it's available.
@@ -170,6 +171,7 @@ def trivy_scan(ref, out_path):
         "--scanners", "vuln",
         "--format", "cyclonedx",
         "--output", f"/out/{name}",
+        *(["--skip-db-update", "--skip-java-db-update", "--offline-scan"] if OFFLINE else []),
         ref,
     ]
     r = run(cmd, SCAN_TIMEOUT)

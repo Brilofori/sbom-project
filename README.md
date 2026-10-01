@@ -225,6 +225,38 @@ and its CycloneDX file stays in `out/registry/`, so `report.py`, `export_cyclone
 reported until the tag is rebuilt. Host mode catches these on its nightly re-scan
 (`cause: db_update`); registry mode doesn't yet.
 
+## Offline hosts
+
+For a host with no internet (no `git clone`, no `pip install`, no Trivy DB download), build
+a kit on a machine that has internet and carry it over on a USB stick.
+
+**1. Build the kit** on a connected machine with Docker and this repo (e.g. `sweri-node-01`):
+```bash
+bash deploy/make-offline-kit.sh ~/sbom-offline-kit          # add --with-mongo if the host needs its own MongoDB
+```
+It contains the code (a git bundle), the pinned Trivy image (tagged
+`aquasec/trivy:sbom-pinned`, because `docker save`/`docker load` can drop the digest), a
+freshly downloaded Trivy vulnerability DB, the Python packages, and `SHA256SUMS`. Python
+packages are built for the kit machine's Python version; `python-version.txt` records it.
+
+**2. Install** on the offline host, from the kit folder, as the user the scanner runs as:
+```bash
+bash install-offline-kit.sh ~/sbom-project
+```
+It checks every file against `SHA256SUMS` and the Trivy image ID before using them, loads
+the image and DB, and installs pymongo (with pip, or unpacked into `vendor/` if the host has
+no pip). It prints the settings to put in `/etc/sbom/env`; the two that matter are
+`SBOM_TRIVY_OFFLINE=1` and `SBOM_TRIVY_IMAGE=aquasec/trivy:sbom-pinned`.
+
+**3. Run** as usual. With `SBOM_TRIVY_OFFLINE=1` both scanners pass Trivy
+`--skip-db-update --skip-java-db-update --offline-scan` and never try the internet;
+`scan_all.py` stops with a clear message if the DB was never loaded.
+
+**Keeping it current.** The DB only knows CVEs published before the kit was built. Rebuild
+the kit and re-run the installer regularly (weekly is reasonable); the scan output records
+the DB date (`db_updated_at`), so old results are easy to spot. Re-running the installer
+updates the code with a fast-forward pull and replaces the DB.
+
 ## How change detection works
 
 **Package identity.** State is tracked per host, per image, per *package identity*: the
@@ -295,6 +327,7 @@ saved without its per-CVE list and flagged `truncated`.
 | `SBOM_TRIVY_CACHE` | `trivy-cache` | Docker volume for Trivy's DB |
 | `SBOM_WAZUH_LOG` | `/var/log/sbom/trivy-findings.jsonl` | Must match the agent's `<location>` |
 | `SBOM_WAZUH_EPS` | `400` | Event lines per second |
+| `SBOM_TRIVY_OFFLINE` | off | `1` on hosts with no internet: use the cached Trivy DB only |
 | `SBOM_REGISTRY_USER`, `SBOM_REGISTRY_PASSWORD` | the `docker login` entry | Registry mode, private registries |
 
 Both systemd units read `/etc/sbom/env` if it exists (one `KEY=value` per line). Put
