@@ -4,7 +4,7 @@ changes to Wazuh as JSON lines.
 
 Usage:
     python3 scan_all.py                  scan every image on this host
-    python3 scan_all.py inventory.txt    scan only the images listed (one per line, # comments ok)
+    python3 scan_all.py images.txt       scan only the images listed (one per line, # comments ok)
     python3 scan_all.py --rebaseline     forget previous state and resend everything once
 
 Per image: Trivy -> CycloneDX JSON (out/) -> compare with state in MongoDB -> append
@@ -79,7 +79,12 @@ def prepare_trivy():
     the same DB. Returns (trivy_version, db_updated_at, db_ready).
     Offline (SBOM_TRIVY_OFFLINE=1) it skips the download and uses the cached DB."""
     if OFFLINE:
-        return _trivy_versions(db_ready=True)
+        version, db_updated, _ = _trivy_versions(db_ready=True)
+        if not db_updated:
+            sys.exit(f"Offline mode, but there is no Trivy vulnerability DB in the "
+                     f"'{TRIVY_CACHE_VOLUME}' volume. Load it from the offline kit first "
+                     "(README, \"Offline hosts\").")
+        return version, db_updated, True
     try:
         r = subprocess.run(trivy_cmd("image", "--download-db-only", "--no-progress"),
                            capture_output=True, text=True, timeout=1800)
@@ -387,9 +392,10 @@ def deliver(events, path=None, eps=None):
 
 
 def ingest(db, image, sbom_path, host=None, scanner_version=None, db_updated=None,
-           wazuh_log=None, eps=None, now=None):
+           wazuh_log=None, eps=None, now=None, extra=None):
     """Parse one Trivy CycloneDX file, deliver changes to Wazuh, then commit state and
-    save the scan. Returns a summary dict."""
+    save the scan. Returns a summary dict. `extra` fields (scan_registry.py's
+    scanner_mode, registry and digest) are added to every event and to the saved scan."""
     host = host or HOSTNAME
     now = now or datetime.now(timezone.utc)
     with open(sbom_path, encoding="utf-8") as f:
@@ -399,6 +405,8 @@ def ingest(db, image, sbom_path, host=None, scanner_version=None, db_updated=Non
     components, flat_vulns, cve_info = parse_sbom(sbom)
     events, comp_ops, vuln_ops, counts, resolved = track_changes(
         db, host, image, components, flat_vulns, meta["image_id"], now)
+    if extra:
+        events = [{**event, **extra} for event in events]
 
     sent = deliver(events, wazuh_log, eps)  # 1. deliver (raises if the log isn't writable)
     if comp_ops:                             # 2. then commit state
@@ -428,6 +436,7 @@ def ingest(db, image, sbom_path, host=None, scanner_version=None, db_updated=Non
                         "type": c.get("type"), "purl": c.get("purl")} for c in components],
         "vulnerabilities": flat_vulns,
         "resolved": resolved,
+        **(extra or {}),
     }
     try:
         db["scans"].insert_one(doc)
@@ -550,7 +559,8 @@ def check_out_dir(out_dir):
 
 
 def acquire_lock(out_dir):
-    """Stop two runs (cron + manual) from racing on the same state."""
+    """Stop two runs (timer + manual, or host + registry mode) from racing on the same
+    state and Wazuh log. Both scanners take this lock."""
     try:
         import fcntl
     except ImportError:  # not on Linux; skip locking
@@ -560,7 +570,7 @@ def acquire_lock(out_dir):
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        sys.exit("Another scan_all.py run is already in progress")
+        sys.exit("Another scan (scan_all.py or scan_registry.py) is already running")
     return handle
 
 
@@ -594,10 +604,6 @@ def main(argv=None):
 
     run_time = datetime.now(timezone.utc).strftime("%d %B %Y, %H:%M UTC")
     version, db_updated, db_ready = prepare_trivy()
-    if OFFLINE and not db_updated:
-        sys.exit(f"Offline mode, but there is no Trivy vulnerability DB in the "
-                 f"'{TRIVY_CACHE_VOLUME}' volume. Load it from the offline kit first "
-                 "(README, \"Offline hosts\").")
     print(f"\nSBOM pipeline  {run_time}")
     print(f"host {HOSTNAME}  |  trivy {version}  |  DB {db_updated or 'unknown'}  |  "
           f"{len(images)} images via {source}")

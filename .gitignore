@@ -11,6 +11,5 @@ __pycache__/
 venv/
 *.bak
 *.swp
-demo_inventory.txt
 *.patch
 vendor/

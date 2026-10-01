@@ -34,7 +34,7 @@ inventory once (the *baseline*).
 
 | File | Purpose |
 |---|---|
-| `scan_registry.py` | Registry mode. Pulls, scans and removes registry images one at a time, feeds Wazuh |
+| `scan_registry.py` | Registry mode. Lists registry tags, then pulls, scans (with `scan_all.py`'s code) and removes one image at a time |
 | `registries.json` | Registry mode config: which repos and tags to scan |
 | `scan_all.py` | Host mode. Scans the images on a host, tracks changes, feeds Wazuh, writes per-image reports |
 | `report.py` | Markdown vulnerability summary for one image |
@@ -44,7 +44,6 @@ inventory once (the *baseline*).
 | `wazuh/sbom_rules.xml` | Manager rules for the pipeline's events |
 | `wazuh/agent_localfile_block.xml` | Agent config that reads the event log |
 | `deploy/` | systemd units (`sbom-registry.*` hourly, `sbom-scan.*` nightly); logrotate config |
-| `inventory.txt` | Optional fixed list of images to scan |
 | `tests/` | Unit tests (`python3 -m pytest`) |
 
 ## Setup (once per host)
@@ -117,12 +116,12 @@ monitors fires rule 592, "Log file size reduced" (level 8), on every rotation.
 
 ```bash
 python3 scan_all.py                     # every tagged image on this host (except Trivy itself)
-python3 scan_all.py inventory.txt       # only the images listed in the file
+python3 scan_all.py images.txt          # only the images listed (one per line, # comments ok)
 python3 scan_all.py --rebaseline        # set state aside and resend the full inventory once
 ```
 The run exits 1 if any image failed, so cron and systemd report failures. One broken
-image doesn't stop the others. Only one run can happen at a time; a second run exits
-immediately.
+image doesn't stop the others. Only one scan runs at a time, in either mode (both scanners
+take the same lock); a second run exits immediately.
 
 Each run does the following:
 
@@ -152,8 +151,9 @@ doesn't need to keep them. Each pass:
    each tag points to.
 2. Skips any image + tag + digest already scanned. A tag is scanned again only when it is
    rebuilt (new digest).
-3. For each new image: pull, scan with Trivy, write the changes to the Wazuh event log,
-   record it in MongoDB, then remove the image. Only one image is on disk at a time, so the
+3. For each new image: pull it, then scan it and send the changes to Wazuh with
+   `scan_all.py`'s own code (same Trivy settings, 30-minute limit, parsing and change
+   tracking), record it, then remove the image. Only one image is on disk at a time, so the
    host needs free space for the largest image plus Trivy's scratch space (about twice the
    image size).
 
@@ -209,17 +209,17 @@ sudo systemctl daemon-reload && sudo systemctl enable --now sbom-registry.timer
 systemctl list-timers sbom-registry.timer
 tail -f /var/log/sbom/registry.log
 ```
-The timer runs 5 minutes after boot, then hourly. Only one pass runs at a time.
+The timer runs 5 minutes after boot, then hourly.
 
 **Events.** Same format and rules as host mode, plus `scanner_mode: "registry"`,
 `registry` and `digest`. In the Wazuh dashboard, `data.scanner_mode:registry` shows only
 registry-mode events; add `and data.sbom_event:component` for one row per package per image.
 
-**State.** Change tracking is kept apart from host mode, in `registry_scans` (one document
-per image + tag + digest, with its attempt count), `registry_component_state` and
-`registry_vuln_state`. Each scan is also saved to `scans` with `scanner_mode: "registry"`,
-and its CycloneDX file stays in `out/registry/`, so `report.py`, `export_cyclonedx.py` and
-`gap_analysis.py` work on registry images too.
+**State.** `registry_scans` has one document per image + tag + digest, with its status and
+attempt count; that's what decides what to scan. Everything else is shared with host mode:
+change tracking in `component_state` and `vuln_state`, scans in `scans` (with
+`scanner_mode: "registry"`), the latest CycloneDX file per image in `out/registry/`. So
+`report.py`, `export_cyclonedx.py` and `gap_analysis.py` work on registry images too.
 
 **Limitation.** An image is scanned once per digest. A CVE published after that scan is not
 reported until the tag is rebuilt. Host mode catches these on its nightly re-scan
@@ -307,10 +307,11 @@ image.
 
 | Collection | One document per | Key fields |
 |---|---|---|
-| `scans` | scan | `host`, `image`, `scanned_at`, `image_id`, `os`, `scanner_version`, `db_updated_at`, counts, `components[]`, `vulnerabilities[]` (per CVE+package: `severity`, `max_severity`, `fixed_version`, `is_new`, `cause`), `resolved[]` |
+| `scans` | scan | `host`, `image`, `scanned_at`, `scanner_mode`/`registry`/`digest` (registry mode), `image_id`, `os`, `scanner_version`, `db_updated_at`, counts, `components[]`, `vulnerabilities[]` (per CVE+package: `severity`, `max_severity`, `fixed_version`, `is_new`, `cause`), `resolved[]` |
 | `component_state` | host + image + package identity | `versions`, `present`, `first_seen`, `last_seen`, `removed_at` |
 | `vuln_state` | host + image + CVE + package identity | `status` (open/resolved), `severity`, `fixed_version`, `first_seen`, `opened_at`, `resolved_at` |
 | `cve_info` | CVE | `description`, `published`, `updated`, `source` |
+| `registry_scans` | registry image + digest (registry mode only) | `repo`, `tag`, `registry`, `status` (ok/failed), `attempts`, `error`, counts |
 
 CVE descriptions are stored once in `cve_info` instead of in every scan. This keeps big
 images well under MongoDB's 16MB document limit. If a scan still exceeds the limit, it is
