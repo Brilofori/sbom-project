@@ -3,6 +3,7 @@
 Every setting can be overridden with an environment variable (see README, "Configuration").
 """
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -20,13 +21,18 @@ OUT_DIR = Path(os.environ.get("SBOM_OUT_DIR", str(BASE_DIR / "out")))
 PACKAGE_TYPES = {"library", "framework", "operating-system"}
 
 
+def redact(uri):
+    """Hide the password in a connection string before it goes in a log."""
+    return re.sub(r"//([^:/@]+):[^@/]*@", r"//\1:***@", uri)
+
+
 def get_db(timeout_ms=5000):
     """Connect and ping, so a stopped MongoDB fails in seconds with a readable message."""
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=timeout_ms)
     try:
         client.admin.command("ping")
     except PyMongoError as e:
-        sys.exit(f"Cannot reach MongoDB at {MONGO_URI}: {e}\n"
+        sys.exit(f"Cannot reach MongoDB at {redact(MONGO_URI)}: {e}\n"
                  "Is the container running?  docker ps -a | grep mongo   then   docker start mongodb")
     return client[DB_NAME]
 

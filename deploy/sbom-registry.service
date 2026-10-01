@@ -1,3 +1,7 @@
+# Copy to /etc/systemd/system/ (with sbom-registry.timer), then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now sbom-registry.timer
+# Run once by hand:   sudo systemctl start sbom-registry.service
+# Logs:               /var/log/sbom/registry.log
 [Unit]
 Description=SWERI SBOM registry scanner (one pass)
 After=network-online.target docker.service
@@ -7,6 +11,9 @@ Wants=network-online.target
 Type=oneshot
 User=kojo
 WorkingDirectory=/home/kojo/sbom-project
+# Settings and secrets (SBOM_MONGO_URI, SBOM_REGISTRY_USER/PASSWORD, ...), one KEY=value per
+# line. Optional: the leading - means the unit still starts if the file doesn't exist.
+EnvironmentFile=-/etc/sbom/env
 ExecStart=/usr/bin/python3 scan_registry.py
 StandardOutput=append:/var/log/sbom/registry.log
 StandardError=append:/var/log/sbom/registry.log
