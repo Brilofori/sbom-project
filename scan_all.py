@@ -41,6 +41,10 @@ TRIVY_CACHE_VOLUME = os.environ.get("SBOM_TRIVY_CACHE", "trivy-cache")
 WAZUH_JSONL = os.environ.get("SBOM_WAZUH_LOG", "/var/log/sbom/trivy-findings.jsonl")
 # The Wazuh agent forwards 500 events/s by default and drops overflow; stay under it.
 WAZUH_EPS = int(os.environ.get("SBOM_WAZUH_EPS", "400"))
+# For hosts with no internet: never download the Trivy DB, use the one already in the
+# trivy-cache volume (loaded from the offline kit, see README "Offline hosts").
+OFFLINE = os.environ.get("SBOM_TRIVY_OFFLINE", "").strip().lower() in ("1", "true", "yes")
+OFFLINE_FLAGS = ["--skip-java-db-update", "--offline-scan"]
 
 TRIVY_REPOS = {"aquasec/trivy", "trivy", "ghcr.io/aquasecurity/trivy",
                "public.ecr.aws/aquasecurity/trivy"}
@@ -72,7 +76,10 @@ def trivy_cmd(*args, mounts=()):
 
 def prepare_trivy():
     """Download the vulnerability DB once, so every image in this run is scanned against
-    the same DB. Returns (trivy_version, db_updated_at, db_ready)."""
+    the same DB. Returns (trivy_version, db_updated_at, db_ready).
+    Offline (SBOM_TRIVY_OFFLINE=1) it skips the download and uses the cached DB."""
+    if OFFLINE:
+        return _trivy_versions(db_ready=True)
     try:
         r = subprocess.run(trivy_cmd("image", "--download-db-only", "--no-progress"),
                            capture_output=True, text=True, timeout=1800)
@@ -83,7 +90,10 @@ def prepare_trivy():
     if not db_ready:
         print("  warning: Trivy DB download failed; each scan will try to update it itself\n"
               f"  {problem}")
+    return _trivy_versions(db_ready)
 
+
+def _trivy_versions(db_ready):
     version, db_updated = "unknown", None
     try:
         r = subprocess.run(trivy_cmd("version", "--format", "json"),
@@ -117,6 +127,8 @@ def scan_image(image, out_dir, skip_db_update):
             "--no-progress", "--output", f"/out/{partial.name}"]
     if skip_db_update:
         args.append("--skip-db-update")
+    if OFFLINE:
+        args += OFFLINE_FLAGS
     cmd = trivy_cmd(*args, image, mounts=("/var/run/docker.sock:/var/run/docker.sock",
                                           f"{out_dir.resolve()}:/out"))
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -582,6 +594,10 @@ def main(argv=None):
 
     run_time = datetime.now(timezone.utc).strftime("%d %B %Y, %H:%M UTC")
     version, db_updated, db_ready = prepare_trivy()
+    if OFFLINE and not db_updated:
+        sys.exit(f"Offline mode, but there is no Trivy vulnerability DB in the "
+                 f"'{TRIVY_CACHE_VOLUME}' volume. Load it from the offline kit first "
+                 "(README, \"Offline hosts\").")
     print(f"\nSBOM pipeline  {run_time}")
     print(f"host {HOSTNAME}  |  trivy {version}  |  DB {db_updated or 'unknown'}  |  "
           f"{len(images)} images via {source}")

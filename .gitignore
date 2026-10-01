@@ -13,3 +13,4 @@ venv/
 *.swp
 demo_inventory.txt
 *.patch
+vendor/
