@@ -2,13 +2,17 @@
 import base64
 import http.server
 import json
+import os
+import shutil
 import threading
 import urllib.parse
 from types import SimpleNamespace
 
 import pytest
 
+import scan_all
 import scan_registry as sr
+from helpers import F127, F128, by_kind, read_events
 from sbom_common import redact
 
 TAGS = ["1.9.0", "1.10.0", "1.10.0-rc1", "2.0.0", "latest"]
@@ -118,5 +122,92 @@ def test_helpers():
         "https://r:5000/v2/a/tags/list?last=b"
     assert sr.next_link(None, "https://r") is None
     uri = "mongodb://sbom:hunter2@mongo.sweri.local:27017/sweri_sbom?tls=true"
-    assert redact(uri) == sr.redact(uri) == "mongodb://sbom:***@mongo.sweri.local:27017/sweri_sbom?tls=true"
+    assert redact(uri) == "mongodb://sbom:***@mongo.sweri.local:27017/sweri_sbom?tls=true"
     assert redact("mongodb://localhost:27017") == "mongodb://localhost:27017"
+
+
+# ---- one image end to end: pull, scan + ship with scan_all's code, record, remove
+
+TRIVY = ("0.74.0", "2026-10-01T00:00:00Z", True)
+ITEM = ("example/app:1.0", "example/app", "1.0", "sha256:aaa", "docker.io")
+
+
+class FakeDocker:
+    """docker pull / image inspect / rmi: the image exists only between pull and rmi."""
+
+    def __init__(self, digest):
+        self.digest, self.present = digest, False
+
+    def __call__(self, cmd, timeout):
+        if cmd[1] in ("pull", "rmi"):
+            self.present = cmd[1] == "pull"
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        out = f"example/app@{self.digest}\n" if "--format" in cmd else ""
+        return SimpleNamespace(returncode=0 if self.present else 1, stdout=out, stderr="")
+
+
+def fake_trivy(fixture):
+    """Trivy run that writes the given CycloneDX fixture where scan_image expects it."""
+    def run(cmd, **kwargs):
+        out_dir = next(v[:-len(":/out")] for v in cmd if v.endswith(":/out"))
+        shutil.copy(fixture, os.path.join(out_dir, os.path.basename(cmd[cmd.index("--output") + 1])))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    return run
+
+
+@pytest.fixture
+def registry_host(tmp_path, wazuh_log, monkeypatch):
+    docker = FakeDocker("sha256:aaa")
+    monkeypatch.setattr(sr, "run", docker)
+    monkeypatch.setattr(sr, "REG_OUT", tmp_path / "registry")
+    monkeypatch.setattr(scan_all, "WAZUH_JSONL", wazuh_log)
+    monkeypatch.setattr(scan_all, "WAZUH_EPS", 0)
+    return docker
+
+
+def test_registry_image_gets_the_same_events_as_host_mode(db, wazuh_log, registry_host, monkeypatch):
+    monkeypatch.setattr(scan_all.subprocess, "run", fake_trivy(F127))
+    assert sr.process(db, ITEM, TRIVY, "linux/amd64")["status"] == "ok"
+    first = read_events(wazuh_log)
+    kinds = by_kind(first)
+    assert (len(kinds["component"]), len(kinds["vulnerability"])) == (8, 7)  # as host mode: no folder paths
+    assert all(e["scanner_mode"] == "registry" and e["digest"] == "sha256:aaa"
+               and e["cause"] == "baseline" for e in first)
+    assert not registry_host.present                                        # removed after the scan
+    assert db.registry_scans.find_one({"image": ITEM[0]})["packages"] == 8
+    assert db.scans.find_one({"image": ITEM[0]})["scanner_mode"] == "registry"
+
+    # the tag is rebuilt (new digest): only the changes are sent, labelled like host mode's
+    registry_host.digest = "sha256:bbb"
+    monkeypatch.setattr(scan_all.subprocess, "run", fake_trivy(F128))
+    sr.process(db, ITEM[:3] + ("sha256:bbb", "docker.io"), TRIVY, "linux/amd64")
+    kinds = by_kind(read_events(wazuh_log)[len(first):])
+    assert len(kinds["component_changed"]) == 4
+    assert [(e["cve_id"], e["cause"]) for e in kinds["vulnerability"]] == [("CVE-2024-2398", "image_changed")]
+
+
+def test_failed_registry_scan_is_recorded_and_the_image_still_removed(db, wazuh_log, registry_host, monkeypatch):
+    monkeypatch.setattr(scan_all.subprocess, "run",
+                        lambda cmd, **k: SimpleNamespace(returncode=1, stdout="", stderr="FATAL boom"))
+    assert sr.process(db, ITEM, TRIVY, "linux/amd64")["status"] == "failed"
+    record = db.registry_scans.find_one({"image": ITEM[0]})
+    assert record["attempts"] == 1 and "FATAL boom" in record["error"]
+    assert not registry_host.present and read_events(wazuh_log) == []
+
+
+def test_pass_skips_done_and_abandoned_images_and_prepares_trivy_only_when_needed(db, monkeypatch):
+    listed = [(f"r/a:{n}", "r/a", str(n), f"sha256:{n}") for n in (1, 2, 3)]
+    monkeypatch.setattr(sr, "list_tags", lambda entry: listed)
+    db.registry_scans.insert_many([{"image": "r/a:1", "digest": "sha256:1", "status": "ok"},
+                                   {"image": "r/a:2", "digest": "sha256:2", "status": "failed",
+                                    "attempts": sr.MAX_ATTEMPTS}])
+    prepared, processed = [], []
+    monkeypatch.setattr(scan_all, "prepare_trivy", lambda: prepared.append(1) or TRIVY)
+    monkeypatch.setattr(sr, "process", lambda db, item, trivy, platform:
+                        processed.append(item[0]) or {"status": "ok"})
+    cfg = {"repositories": [{"repo": "r/a"}]}
+    sr.one_pass(cfg, db)
+    assert (processed, prepared) == (["r/a:3"], [1])
+    db.registry_scans.insert_one({"image": "r/a:3", "digest": "sha256:3", "status": "ok"})
+    sr.one_pass(cfg, db)
+    assert prepared == [1]                                                  # nothing new, no DB download
