@@ -18,6 +18,11 @@ events show what changed.
 Only one image is ever on disk at a time, which is what makes this
 workable for 10-30GB images.
 
+Registries: Docker Hub (via its own API) and any registry that speaks the
+Docker Registry v2 API - Harbor, GitLab, Nexus, Artifactory, plain registry:2.
+Private registries use the login saved by `docker login <host>`, or
+SBOM_REGISTRY_USER / SBOM_REGISTRY_PASSWORD.
+
 Usage:
   python3 scan_registry.py              # one pass (use with the hourly timer)
   python3 scan_registry.py --dry-run    # list what would be scanned, pull nothing
@@ -26,6 +31,8 @@ Usage:
 """
 
 import argparse
+import base64
+import hashlib
 import fcntl
 import json
 import os
@@ -34,6 +41,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -43,7 +51,8 @@ from pymongo import MongoClient, UpdateOne
 HOSTNAME = socket.gethostname()
 MONGO_URI = os.environ.get("SBOM_MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.environ.get("SBOM_DB", "sweri_sbom")
-WAZUH_JSONL = os.environ.get("SBOM_JSONL", "/var/log/sbom/trivy-findings.jsonl")
+WAZUH_JSONL = (os.environ.get("SBOM_WAZUH_LOG") or os.environ.get("SBOM_JSONL")
+               or "/var/log/sbom/trivy-findings.jsonl")       # same variable as scan_all.py
 LOCK_PATH = "/tmp/sbom-scan-registry.lock"
 OUT_DIR = "out/registry"
 MAX_ATTEMPTS = 3          # give up on an image after this many failed passes
@@ -56,6 +65,11 @@ try:
     from scan_all import TRIVY_IMAGE  # noqa: F401
 except Exception:
     TRIVY_IMAGE = os.environ.get("SBOM_TRIVY_IMAGE", "aquasec/trivy:latest")
+
+
+def redact(uri):
+    """Hide the password in a connection string before it goes in a log."""
+    return re.sub(r"//([^:/@]+):[^@/]*@", r"//\1:***@", uri)
 
 
 def log(msg):
@@ -75,6 +89,7 @@ def list_tags(entry):
     Return [(image_ref, repo, tag, digest)] for one repository in the config,
     newest first, filtered by include/exclude and capped at `limit`.
     Uses the Docker Hub API, so nothing is pulled at this stage.
+    Other registries go through list_tags_v2().
     """
     repo = entry["repo"]
     if "/" not in repo:
@@ -129,10 +144,12 @@ def pull(ref, platform):
 def local_digest(ref):
     r = run(["docker", "image", "inspect", ref, "--format",
              "{{range .RepoDigests}}{{println .}}{{end}}"], 60)
-    for line in r.stdout.splitlines():
-        if "@" in line:
-            return line.split("@", 1)[1].strip()
-    return None
+    name = ref.rsplit(":", 1)[0] if ":" in ref.rsplit("/", 1)[-1] else ref
+    lines = [l.strip() for l in r.stdout.splitlines() if "@" in l]
+    for line in lines:                      # the digest recorded for this repo, if there are several
+        if line.split("@", 1)[0] == name:
+            return line.split("@", 1)[1]
+    return lines[0].split("@", 1)[1] if lines else None
 
 
 def remove(ref):
@@ -383,6 +400,145 @@ def process(db, image, repo, tag, digest, registry, platform):
             remove(image)
 
 
+# ---------------------------------------------------------------- registry v2 (Harbor, GitLab, registry:2, ...)
+
+DOCKER_HUB = {"docker.io", "index.docker.io", "registry-1.docker.io"}
+MANIFEST_TYPES = ", ".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+])
+INDEX_TYPES = {"application/vnd.oci.image.index.v1+json",
+               "application/vnd.docker.distribution.manifest.list.v2+json"}
+
+
+def registry_creds(host):
+    """(user, password) for a registry: SBOM_REGISTRY_USER/PASSWORD, else the entry that
+    `docker login <host>` saved in ~/.docker/config.json. None if there isn't one."""
+    user, pw = os.environ.get("SBOM_REGISTRY_USER"), os.environ.get("SBOM_REGISTRY_PASSWORD")
+    if user and pw:
+        return user, pw
+    path = os.path.join(os.environ.get("DOCKER_CONFIG") or os.path.expanduser("~/.docker"), "config.json")
+    try:
+        with open(path) as f:
+            auths = json.load(f).get("auths", {})
+    except (OSError, ValueError):
+        return None
+    for key in (host, f"https://{host}", f"http://{host}"):
+        saved = (auths.get(key) or {}).get("auth")
+        if saved:
+            user, _, pw = base64.b64decode(saved).decode().partition(":")
+            return user, pw
+    return None
+
+
+def version_key(tag):
+    """Sort key that puts 1.10 after 1.9. Used to pick the newest tags, since the v2 API
+    lists tags alphabetically and has no dates."""
+    return [(0, int(t)) if t.isdigit() else (1, t) for t in re.split(r"(\d+)", tag) if t]
+
+
+def next_link(header, base):
+    """The next-page URL from a v2 `Link: </v2/...?last=x>; rel="next"` header."""
+    m = re.search(r'<([^>]+)>\s*;\s*rel="?next"?', header or "")
+    return urllib.parse.urljoin(base, m.group(1)) if m else None
+
+
+class V2Registry:
+    """Minimal Docker Registry v2 client: tag lists and manifest digests, with the Basic and
+    Bearer-token logins that registry:2, Harbor, GitLab, Nexus and Artifactory use."""
+
+    def __init__(self, host, insecure=False):
+        self.host = host
+        self.base = f"{'http' if insecure else 'https'}://{host}"
+        self.creds = registry_creds(host)
+        self.auth = {}                      # scope -> Authorization header value
+
+    def get(self, path, scope, accept=None):
+        url = urllib.parse.urljoin(self.base, path)
+        for attempt in (1, 2):
+            headers = {"User-Agent": "sweri-sbom-scanner"}
+            if accept:
+                headers["Accept"] = accept
+            if scope in self.auth:
+                headers["Authorization"] = self.auth[scope]
+            try:
+                return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30)
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and attempt == 2:
+                    raise RuntimeError(f"{self.host} rejected the scanner's login; check `docker login "
+                                       f"{self.host}` or SBOM_REGISTRY_USER/PASSWORD") from None
+                if e.code != 401:
+                    raise RuntimeError(f"{url}: HTTP {e.code} {e.reason}") from None
+                self.auth[scope] = self.login(e.headers.get("WWW-Authenticate", ""), scope)
+
+    def login(self, challenge, scope):
+        scheme, _, params = challenge.partition(" ")
+        if scheme.lower() == "basic":
+            if not self.creds:
+                raise RuntimeError(f"{self.host} needs a login: run `docker login {self.host}` "
+                                   "as the scanner's user, or set SBOM_REGISTRY_USER/PASSWORD")
+            return "Basic " + base64.b64encode(":".join(self.creds).encode()).decode()
+        if scheme.lower() == "bearer":
+            p = dict(re.findall(r'(\w+)="([^"]*)"', params))
+            query = {k: v for k, v in (("service", p.get("service")), ("scope", scope)) if v}
+            headers = {"User-Agent": "sweri-sbom-scanner"}
+            if self.creds:
+                headers["Authorization"] = "Basic " + base64.b64encode(":".join(self.creds).encode()).decode()
+            req = urllib.request.Request(p["realm"] + "?" + urllib.parse.urlencode(query), headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    data = json.load(r)
+            except urllib.error.HTTPError as e:
+                raise RuntimeError(f"{self.host} token request refused (HTTP {e.code}); "
+                                   "check the scanner's registry login") from None
+            return "Bearer " + (data.get("token") or data.get("access_token"))
+        raise RuntimeError(f"{self.host}: unsupported login challenge {challenge[:60]!r}")
+
+    def tags(self, repo):
+        scope, names, url, pages = f"repository:{repo}:pull", [], f"/v2/{repo}/tags/list?n=1000", 0
+        while url and pages < 100:
+            with self.get(url, scope) as r:
+                names += json.load(r).get("tags") or []
+                url = next_link(r.headers.get("Link"), self.base)
+            pages += 1
+        return names
+
+    def digest(self, repo, tag, platform):
+        """The digest `docker pull` will record for repo:tag, or None if the tag has no image
+        for this platform. A single-platform manifest is assumed to match."""
+        with self.get(f"/v2/{repo}/manifests/{tag}", f"repository:{repo}:pull", MANIFEST_TYPES) as r:
+            body = r.read()
+            digest = r.headers.get("Docker-Content-Digest") or "sha256:" + hashlib.sha256(body).hexdigest()
+            ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip()
+        doc = json.loads(body)
+        if ctype in INDEX_TYPES or doc.get("manifests"):
+            os_name, arch = platform.split("/")[:2]
+            if not any((m.get("platform") or {}).get("os") == os_name and
+                       (m.get("platform") or {}).get("architecture") == arch
+                       for m in doc.get("manifests", [])):
+                return None
+        return digest
+
+
+def list_tags_v2(entry, reg):
+    """Same as list_tags(), for a v2 registry. "Newest" means the highest version number."""
+    repo = entry["repo"]
+    include = re.compile(entry.get("include", ".*"))
+    exclude = re.compile(entry["exclude"]) if entry.get("exclude") else None
+    limit = int(entry.get("limit", 5))
+    names = [t for t in reg.tags(repo) if include.search(t) and not (exclude and exclude.search(t))]
+    found = []
+    for name in sorted(names, key=version_key, reverse=True):
+        digest = reg.digest(repo, name, entry["platform"])
+        if digest:
+            found.append((f"{reg.host}/{repo}:{name}", repo, name, digest))
+        if len(found) >= limit:
+            break
+    return found
+
+
 # ---------------------------------------------------------------- one pass
 
 def one_pass(cfg, db, dry_run=False):
@@ -390,13 +546,20 @@ def one_pass(cfg, db, dry_run=False):
     platform = cfg.get("platform", "linux/amd64")
     done = db["registry_scans"]
 
+    clients = {}
     todo = []
     for entry in cfg["repositories"]:
         entry.setdefault("platform", platform)
+        reg_name = entry.get("registry", registry)
         try:
-            tags = list_tags(entry)
+            if reg_name in DOCKER_HUB:
+                tags = list_tags(entry)
+            else:
+                if reg_name not in clients:
+                    clients[reg_name] = V2Registry(reg_name, entry.get("insecure", cfg.get("insecure", False)))
+                tags = list_tags_v2(entry, clients[reg_name])
         except Exception as e:
-            log(f"could not list {entry['repo']}: {e}")
+            log(f"could not list {entry['repo']} on {reg_name}: {e}")
             continue
         log(f"{entry['repo']}: {len(tags)} tag(s) in scope")
         for image, repo, tag, digest in tags:
@@ -406,18 +569,18 @@ def one_pass(cfg, db, dry_run=False):
             if prev and prev.get("attempts", 0) >= MAX_ATTEMPTS:
                 log(f"  giving up on {image} after {prev['attempts']} failures")
                 continue
-            todo.append((image, repo, tag, digest))
+            todo.append((image, repo, tag, digest, reg_name))
 
     log(f"{len(todo)} image(s) not yet scanned")
     if dry_run:
-        for image, _, _, digest in todo:
+        for image, _, _, digest, _ in todo:
             print(f"  would scan {image}  {digest[:19]}")
         return []
 
     results = []
-    for n, (image, repo, tag, digest) in enumerate(todo, 1):
+    for n, (image, repo, tag, digest, reg_name) in enumerate(todo, 1):
         log(f"[{n}/{len(todo)}] {image}")
-        results.append(process(db, image, repo, tag, digest, registry, platform))
+        results.append(process(db, image, repo, tag, digest, reg_name, platform))
     return results
 
 
@@ -432,7 +595,7 @@ def preflight():
     try:
         client.admin.command("ping")
     except Exception as e:
-        sys.exit(f"MongoDB not reachable at {MONGO_URI}: {e}")
+        sys.exit(f"MongoDB not reachable at {redact(MONGO_URI)}: {e}")
     db = client[DB_NAME]
     db["registry_scans"].create_index([("image", 1), ("digest", 1)], unique=True)
     db["registry_component_state"].create_index([("image", 1), ("identity", 1), ("removed_at", 1)])

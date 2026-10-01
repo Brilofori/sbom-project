@@ -170,11 +170,37 @@ python3 scan_registry.py                # one pass
 {"repo": "python", "include": "^3\\.\\d+\\.\\d+-slim$", "limit": 5, "platform": "linux/amd64"}
 ```
 `include` and `exclude` are regular expressions on the tag, `limit` keeps the newest N
-matching tags. Docker Hub is the only registry type supported so far. Any registry that
-speaks the Docker Registry v2 API (Harbor, GHCR, ECR, a private `registry:2`) can be added
-with a tag-listing function and credentials; pull, scan and ship stay the same. Anonymous
-Docker Hub pulls are rate-limited, so run `docker login` with a free account on the
-scanning host.
+matching tags. Anonymous Docker Hub pulls are rate-limited, so run `docker login` with a
+free account on the scanning host.
+
+**Private registries.** Any registry that speaks the Docker Registry v2 API works: Harbor,
+GitLab, Nexus, Artifactory, a plain `registry:2`. Set `registry` to its `host:port`; a
+repo entry can also set its own `registry`, so one config can cover several:
+```json
+{
+  "registry": "registry.sweri.local:5000",
+  "platform": "linux/amd64",
+  "repositories": [
+    {"repo": "ml/inference-server", "include": "^\\d+\\.\\d+\\.\\d+$", "limit": 5},
+    {"repo": "redis", "registry": "docker.io", "include": "-alpine$", "limit": 2}
+  ]
+}
+```
+On the scanning host, as the user the scanner runs as:
+1. `docker login registry.sweri.local:5000` with a read-only account (a robot account in
+   Harbor). The scanner reads the same saved login to list tags. If Docker uses a
+   credential helper instead, put `SBOM_REGISTRY_USER` and `SBOM_REGISTRY_PASSWORD` in
+   `/etc/sbom/env`.
+2. If the registry's certificate comes from an internal CA, install the CA for both Docker
+   (`/etc/docker/certs.d/registry.sweri.local:5000/ca.crt`) and the OS
+   (`/usr/local/share/ca-certificates/`, then `sudo update-ca-certificates`).
+3. A registry on plain HTTP needs `"insecure": true` in the config and an
+   `insecure-registries` entry in `/etc/docker/daemon.json`. Avoid this outside a lab.
+
+The v2 API lists tags alphabetically with no dates, so "newest" means the highest version
+number (1.10 above 1.9). Use `include` to keep tags like `latest` or `dev-*` out.
+Run `--dry-run` first: it lists the tags and digests without pulling anything, and a bad
+login or certificate shows up there.
 
 **Schedule.** Setup steps 1 to 6 apply here too. Then:
 ```bash
@@ -269,6 +295,11 @@ saved without its per-CVE list and flagged `truncated`.
 | `SBOM_TRIVY_CACHE` | `trivy-cache` | Docker volume for Trivy's DB |
 | `SBOM_WAZUH_LOG` | `/var/log/sbom/trivy-findings.jsonl` | Must match the agent's `<location>` |
 | `SBOM_WAZUH_EPS` | `400` | Event lines per second |
+| `SBOM_REGISTRY_USER`, `SBOM_REGISTRY_PASSWORD` | the `docker login` entry | Registry mode, private registries |
+
+Both systemd units read `/etc/sbom/env` if it exists (one `KEY=value` per line). Put
+secrets such as a MongoDB URI with a password there, with `sudo chmod 600 /etc/sbom/env`,
+not in the units or the repo. Error messages hide the MongoDB password.
 
 ## Upgrading an install that ran the September 2026 version
 
@@ -304,8 +335,9 @@ saved without its per-CVE list and flagged `truncated`.
 - **Single architecture.** Scans run on the host's architecture (x86_64 in the lab).
 - **Scanner coverage.** Coverage and severity data are Trivy's. No second scanner (e.g.
   Grype) cross-checks the results yet.
-- **No MongoDB authentication.** It relies on the localhost binding. Add authentication if
-  MongoDB ever moves off the host. Several hosts can share one database, because all state
+- **No MongoDB authentication in the lab setup.** It relies on the localhost binding. To use
+  a remote MongoDB, set `SBOM_MONGO_URI` (with user, password and `tls=true`) in
+  `/etc/sbom/env`. Several hosts can share one database, because all state
   is keyed per host.
 - **Very large images are slow.** A 15GB ML image overran Trivy's default 5-minute timeout,
   so the pipeline allows 30 minutes per image. Its baseline sends several thousand events at
