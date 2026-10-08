@@ -211,3 +211,24 @@ def test_pass_skips_done_and_abandoned_images_and_prepares_trivy_only_when_neede
     db.registry_scans.insert_one({"image": "r/a:3", "digest": "sha256:3", "status": "ok"})
     sr.one_pass(cfg, db)
     assert prepared == [1]                                                  # nothing new, no DB download
+
+
+def test_old_format_state_is_set_aside_not_crashed_on(monkeypatch, tmp_path):
+    """A MongoDB that ran the September version: state keyed on purl, no host/identity.
+    Building the new unique index on it used to fail with a duplicate key error."""
+    db = __import__("mongomock").MongoClient().db
+    old = {"image": "python:3.11-slim", "cve_id": "CVE-2007-5686", "purl": "pkg:deb/debian/login@1"}
+    db.vuln_state.insert_many([dict(old), {**old, "purl": "pkg:deb/debian/passwd@1"}])
+    monkeypatch.setattr(sr, "get_db", lambda: db)
+    monkeypatch.setattr(sr, "OUT_DIR", tmp_path)
+    monkeypatch.setattr(sr, "REG_OUT", tmp_path / "registry")
+    monkeypatch.setattr(scan_all, "check_wazuh_log", lambda path: None)
+    monkeypatch.setattr(sr, "one_pass", lambda cfg, db, dry_run=False: [])
+    cfg = tmp_path / "reg.json"
+    cfg.write_text(json.dumps({"repositories": []}))
+
+    assert sr.main(["--config", str(cfg), "--dry-run"]) == 0
+    assert "vuln_state_legacy" not in db.list_collection_names()          # dry run: untouched
+    assert sr.main(["--config", str(cfg)]) == 0
+    assert db.vuln_state_legacy.count_documents({}) == 2                  # kept, not deleted
+    assert db.vuln_state.count_documents({}) == 0
