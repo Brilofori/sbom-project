@@ -40,7 +40,8 @@ inventory once (the *baseline*).
 | `report.py` | Markdown vulnerability summary for one image |
 | `export_cyclonedx.py` | One consolidated CycloneDX SBOM file for every scanned image (deliverable 3) |
 | `gap_analysis.py` | Wazuh Syscollector (host) vs Trivy (container) inventory comparison (deliverable 4) |
-| `sbom_common.py` | Shared settings and helpers |
+| `sbom_common.py` | Shared settings and helpers; reads `.env` |
+| `.env.example` | Template for the machine's settings (copy to `.env`) |
 | `wazuh/sbom_rules.xml` | Manager rules for the pipeline's events |
 | `wazuh/agent_localfile_block.xml` | Agent config that reads the event log |
 | `deploy/` | systemd units (`sbom-registry.*` hourly, `sbom-scan.*` nightly); logrotate config |
@@ -58,10 +59,12 @@ dedicated user if you can.
 sudo usermod -aG docker $USER        # then log out and back in
 git clone https://github.com/Brilofori/sbom-project.git && cd sbom-project
 pip install -r requirements.txt
+cp .env.example .env && chmod 600 .env    # this machine's settings; see Configuration
 ```
 
-**2. MongoDB.** Bind it to localhost only, keep its data in a named volume, and pin the
-version. Docker's `-p 27017:27017` publishes on every interface and bypasses UFW, and
+**2. MongoDB.** If the machine already runs MongoDB, skip this step and put its address in
+`.env` (`SBOM_MONGO_URI`) unless it is on localhost without a password. Otherwise, start one
+bound to localhost only, with its data in a named volume and the version pinned. Docker's `-p 27017:27017` publishes on every interface and bypasses UFW, and
 this MongoDB has no authentication.
 ```bash
 docker run -d --name mongodb --restart unless-stopped \
@@ -190,7 +193,7 @@ On the scanning host, as the user the scanner runs as:
 1. `docker login registry.sweri.local:5000` with a read-only account (a robot account in
    Harbor). The scanner reads the same saved login to list tags. If Docker uses a
    credential helper instead, put `SBOM_REGISTRY_USER` and `SBOM_REGISTRY_PASSWORD` in
-   `/etc/sbom/env`.
+   `.env`.
 2. If the registry's certificate comes from an internal CA, install the CA for both Docker
    (`/etc/docker/certs.d/registry.sweri.local:5000/ca.crt`) and the OS
    (`/usr/local/share/ca-certificates/`, then `sudo update-ca-certificates`).
@@ -224,38 +227,6 @@ change tracking in `component_state` and `vuln_state`, scans in `scans` (with
 **Limitation.** An image is scanned once per digest. A CVE published after that scan is not
 reported until the tag is rebuilt. Host mode catches these on its nightly re-scan
 (`cause: db_update`); registry mode doesn't yet.
-
-## Offline hosts
-
-For a host with no internet (no `git clone`, no `pip install`, no Trivy DB download), build
-a kit on a machine that has internet and carry it over on a USB stick.
-
-**1. Build the kit** on a connected machine with Docker and this repo (e.g. `sweri-node-01`):
-```bash
-bash deploy/make-offline-kit.sh ~/sbom-offline-kit          # add --with-mongo if the host needs its own MongoDB
-```
-It contains the code (a git bundle), the pinned Trivy image (tagged
-`aquasec/trivy:sbom-pinned`, because `docker save`/`docker load` can drop the digest), a
-freshly downloaded Trivy vulnerability DB, the Python packages, and `SHA256SUMS`. Python
-packages are built for the kit machine's Python version; `python-version.txt` records it.
-
-**2. Install** on the offline host, from the kit folder, as the user the scanner runs as:
-```bash
-bash install-offline-kit.sh ~/sbom-project
-```
-It checks every file against `SHA256SUMS` and the Trivy image ID before using them, loads
-the image and DB, and installs pymongo (with pip, or unpacked into `vendor/` if the host has
-no pip). It prints the settings to put in `/etc/sbom/env`; the two that matter are
-`SBOM_TRIVY_OFFLINE=1` and `SBOM_TRIVY_IMAGE=aquasec/trivy:sbom-pinned`.
-
-**3. Run** as usual. With `SBOM_TRIVY_OFFLINE=1` both scanners pass Trivy
-`--skip-db-update --skip-java-db-update --offline-scan` and never try the internet;
-`scan_all.py` stops with a clear message if the DB was never loaded.
-
-**Keeping it current.** The DB only knows CVEs published before the kit was built. Rebuild
-the kit and re-run the installer regularly (weekly is reasonable); the scan output records
-the DB date (`db_updated_at`), so old results are easy to spot. Re-running the installer
-updates the code with a fast-forward pull and replaces the DB.
 
 ## How change detection works
 
@@ -328,12 +299,13 @@ saved without its per-CVE list and flagged `truncated`.
 | `SBOM_TRIVY_CACHE` | `trivy-cache` | Docker volume for Trivy's DB |
 | `SBOM_WAZUH_LOG` | `/var/log/sbom/trivy-findings.jsonl` | Must match the agent's `<location>` |
 | `SBOM_WAZUH_EPS` | `400` | Event lines per second |
-| `SBOM_TRIVY_OFFLINE` | off | `1` on hosts with no internet: use the cached Trivy DB only |
 | `SBOM_REGISTRY_USER`, `SBOM_REGISTRY_PASSWORD` | the `docker login` entry | Registry mode, private registries |
 
-Both systemd units read `/etc/sbom/env` if it exists (one `KEY=value` per line). Put
-secrets such as a MongoDB URI with a password there, with `sudo chmod 600 /etc/sbom/env`,
-not in the units or the repo. Error messages hide the MongoDB password.
+Put the settings for a machine in `.env` in the repo folder (start from `.env.example`):
+one `KEY=value` per line, comments on their own line. Every script reads it, whether run
+by hand or by the systemd timers, and git ignores it. Run `chmod 600 .env` if it holds a
+password; error messages hide the MongoDB password. A variable set in the environment
+overrides `.env`, e.g. `SBOM_DB=test python3 scan_all.py`.
 
 ## Upgrading an install that ran the September 2026 version
 
@@ -371,7 +343,7 @@ not in the units or the repo. Error messages hide the MongoDB password.
   Grype) cross-checks the results yet.
 - **No MongoDB authentication in the lab setup.** It relies on the localhost binding. To use
   a remote MongoDB, set `SBOM_MONGO_URI` (with user, password and `tls=true`) in
-  `/etc/sbom/env`. Several hosts can share one database, because all state
+  `.env`. Several hosts can share one database, because all state
   is keyed per host.
 - **Very large images are slow.** A 15GB ML image overran Trivy's default 5-minute timeout,
   so the pipeline allows 30 minutes per image. Its baseline sends several thousand events at
