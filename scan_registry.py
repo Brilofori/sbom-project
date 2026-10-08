@@ -390,8 +390,11 @@ def main(argv=None):
     scan_all.check_out_dir(REG_OUT)
     scan_all.check_wazuh_log(scan_all.WAZUH_JSONL)
     db = get_db()
-    scan_all.ensure_indexes(db)
-    db["registry_scans"].create_index([("image", 1), ("digest", 1)], unique=True)
+    if not args.dry_run:            # a dry run only reads; it never changes the database
+        for name in scan_all.migrate_legacy_state(db):
+            log(f"old-format state set aside as {name} (kept, not deleted)")
+        scan_all.ensure_indexes(db)
+        db["registry_scans"].create_index([("image", 1), ("digest", 1)], unique=True)
     log(f"Registry scanner on {scan_all.HOSTNAME}, Trivy {scan_all.TRIVY_IMAGE}")
 
     results = one_pass(cfg, db, dry_run=args.dry_run)
