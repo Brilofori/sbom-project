@@ -11,9 +11,7 @@ Wants=network-online.target
 Type=oneshot
 User=kojo
 WorkingDirectory=/home/kojo/sbom-project
-# Settings and secrets (SBOM_MONGO_URI, SBOM_REGISTRY_USER/PASSWORD, ...), one KEY=value per
-# line. Optional: the leading - means the unit still starts if the file doesn't exist.
-EnvironmentFile=-/etc/sbom/env
+# Settings (MongoDB address, ...) come from the .env file in the repo (README, Configuration).
 ExecStart=/usr/bin/python3 scan_registry.py
 StandardOutput=append:/var/log/sbom/registry.log
 StandardError=append:/var/log/sbom/registry.log

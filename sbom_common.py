@@ -1,6 +1,7 @@
 """Settings and helpers shared by the SBOM pipeline scripts.
 
-Every setting can be overridden with an environment variable (see README, "Configuration").
+Every setting has a default and can be changed in the repo's .env file or with an
+environment variable (see README, "Configuration").
 """
 import os
 import re
@@ -11,6 +12,30 @@ from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def load_env_file(path=BASE_DIR / ".env"):
+    """Put the KEY=value lines of the repo's .env file, if there is one, into the
+    environment. Variables that are already set win, so `SBOM_DB=test python3 scan_all.py`
+    still works. Blank lines and lines starting with # are skipped; values may be quoted."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.removeprefix("export ").partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+load_env_file()
 MONGO_URI = os.environ.get("SBOM_MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.environ.get("SBOM_DB", "sweri_sbom")
 OUT_DIR = Path(os.environ.get("SBOM_OUT_DIR", str(BASE_DIR / "out")))

@@ -13,10 +13,6 @@ Type=oneshot
 # /var/log/sbom (see README, Setup).
 User=kojo
 WorkingDirectory=/home/kojo/sbom-project
-# Settings and secrets (SBOM_MONGO_URI, SBOM_REGISTRY_USER/PASSWORD, ...), one KEY=value per
-# line. Optional: the leading - means the unit still starts if the file doesn't exist.
-EnvironmentFile=-/etc/sbom/env
+# Settings (MongoDB address, ...) come from the .env file in the repo (README, Configuration).
 ExecStart=/usr/bin/python3 -u /home/kojo/sbom-project/scan_all.py
-# Optional settings (README, Configuration), e.g.:
-# Environment=SBOM_TRIVY_IMAGE=aquasec/trivy@sha256:...
 TimeoutStartSec=4h
