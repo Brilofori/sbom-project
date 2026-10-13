@@ -54,6 +54,14 @@ def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def tag_filter(entry):
+    """The config entry's include/exclude regexes as one test, and its `limit`."""
+    include = re.compile(entry.get("include", ".*"))
+    exclude = re.compile(entry["exclude"]) if entry.get("exclude") else None
+    return (lambda tag: bool(include.search(tag)) and not (exclude and exclude.search(tag)),
+            int(entry.get("limit", 5)))
+
+
 # ---------------------------------------------------------------- Docker Hub
 
 def hub_get(url):
@@ -71,9 +79,7 @@ def list_tags(entry):
     repo = entry["repo"]
     if "/" not in repo:
         repo = f"library/{repo}"                    # official images live under library/
-    include = re.compile(entry.get("include", ".*"))
-    exclude = re.compile(entry["exclude"]) if entry.get("exclude") else None
-    limit = int(entry.get("limit", 5))
+    wanted, limit = tag_filter(entry)
     os_name, arch = entry.get("platform", "linux/amd64").split("/")[:2]
 
     url = (f"https://hub.docker.com/v2/repositories/{repo}/tags"
@@ -84,7 +90,7 @@ def list_tags(entry):
         pages += 1
         for t in data.get("results", []):
             name = t.get("name", "")
-            if not include.search(name) or (exclude and exclude.search(name)):
+            if not wanted(name):
                 continue
             # only take tags that actually have an image for our platform
             if not any(i.get("os") == os_name and i.get("architecture") == arch
@@ -227,10 +233,8 @@ class V2Registry:
 def list_tags_v2(entry, reg):
     """Same as list_tags(), for a v2 registry. "Newest" means the highest version number."""
     repo = entry["repo"]
-    include = re.compile(entry.get("include", ".*"))
-    exclude = re.compile(entry["exclude"]) if entry.get("exclude") else None
-    limit = int(entry.get("limit", 5))
-    names = [t for t in reg.tags(repo) if include.search(t) and not (exclude and exclude.search(t))]
+    wanted, limit = tag_filter(entry)
+    names = [t for t in reg.tags(repo) if wanted(t)]
     found = []
     for name in sorted(names, key=version_key, reverse=True):
         digest = reg.digest(repo, name, entry["platform"])

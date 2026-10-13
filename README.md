@@ -288,6 +288,10 @@ CVE descriptions are stored once in `cve_info` instead of in every scan. This ke
 images well under MongoDB's 16MB document limit. If a scan still exceeds the limit, it is
 saved without its per-CVE list and flagged `truncated`.
 
+State written by the September 2026 version (keyed on the full purl) is moved aside to
+`vuln_state_legacy` and `component_state_legacy` on the first run, kept rather than deleted,
+and the full inventory is sent once as a new baseline. Both scanners do this.
+
 ## Configuration
 
 | Variable | Default | |
@@ -307,28 +311,6 @@ by hand or by the systemd timers, and git ignores it. Run `chmod 600 .env` if it
 password; error messages hide the MongoDB password. A variable set in the environment
 overrides `.env`, e.g. `SBOM_DB=test python3 scan_all.py`.
 
-## Upgrading an install that ran the September 2026 version
-
-1. **Pull the new code, then update Wazuh.** Update the manager rules (setup step 6) and
-   the agent block (step 5), and add `<only-future-events>no</only-future-events>`.
-2. **Recreate MongoDB bound to localhost, keeping its data.** Step 2 above is for a new
-   install; use these commands here instead.
-   ```bash
-   docker inspect mongodb --format '{{range .Mounts}}{{if eq .Destination "/data/db"}}{{.Name}}{{end}}{{end}}'
-   docker exec mongodb mongod --version | head -1       # stay on this major version
-   docker stop mongodb && docker rename mongodb mongodb-old
-   docker run -d --name mongodb --restart unless-stopped -p 127.0.0.1:27017:27017 \
-     -v <volume-name-from-line-1>:/data/db mongo:<major.minor-from-line-2>
-   # after a successful scan: docker rm mongodb-old
-   ```
-3. **Run `python3 scan_all.py`.** The old state was keyed on the full purl, so it is renamed
-   to `vuln_state_legacy` and `component_state_legacy` (kept, not deleted). This run then
-   **re-sends the full inventory once**, with `cause: baseline`, so expect one batch of
-   alerts. It also restores anything that was sent before the rules were loaded on the
-   manager, which only ever reached the archives. Once satisfied, drop the legacy
-   collections with
-   `docker exec mongodb mongosh sweri_sbom --eval 'db.vuln_state_legacy.drop(); db.component_state_legacy.drop()'`.
-
 ## Known limitations
 
 - **Conda.** Trivy lists Conda packages only from named environments
@@ -336,8 +318,8 @@ overrides `.env`, e.g. `SBOM_DB=test python3 scan_all.py`.
   Conda packages. ML images that install into `/opt/conda` can therefore miss their Conda
   layer. Pip-installed packages (`.dist-info`) are covered. To check an image, run
   `docker run --rm --entrypoint sh <image> -c 'ls /opt/conda/envs; ls /opt/conda/conda-meta | wc -l'`.
-- **Only local images are scanned, by tag.** A tag like `:latest` can point to a different
-  image later. The image ID recorded with every scan shows when it moved.
+- **Host mode scans by tag.** A tag like `:latest` can point to a different image later.
+  The image ID recorded with every scan shows when it moved. (Registry mode tracks digests.)
 - **Single architecture.** Scans run on the host's architecture (x86_64 in the lab).
 - **Scanner coverage.** Coverage and severity data are Trivy's. No second scanner (e.g.
   Grype) cross-checks the results yet.
