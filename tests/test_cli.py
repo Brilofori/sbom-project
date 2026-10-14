@@ -120,10 +120,18 @@ def test_main_end_to_end(monkeypatch, tmp_path, db, capsys):
     assert "FATAL unable to find the specified image" in out
     assert "(1 ok, 1 failed)" in out
     assert (tmp_path / "out" / "example_app_1.0.json").exists()
-    assert len(read_events(str(log))) == BASELINE_EVENTS
+    events = read_events(str(log))
+    findings = [e for e in events if e["sbom_event"] != "scan_run"]
+    assert len(findings) == BASELINE_EVENTS
+    summary = events[-1]                                           # one summary, written last
+    assert (summary["sbom_event"], summary["run_status"], summary["scanned"], summary["failed"]) == \
+        ("scan_run", "failed", 1, 1)
+    assert "broken/image:1" in summary["errors"] and "unable to find" in summary["errors"]
 
     assert scan_all.main([]) == 1                                  # second run: nothing new to send
-    assert len(read_events(str(log))) == BASELINE_EVENTS
+    events = read_events(str(log))
+    assert len([e for e in events if e["sbom_event"] != "scan_run"]) == BASELINE_EVENTS
+    assert [e["sbom_event"] for e in events].count("scan_run") == 2
 
 
 def test_db_download_timeout_does_not_hang_the_run(monkeypatch):
@@ -156,3 +164,15 @@ def test_env_file_fills_in_settings_but_the_environment_wins(tmp_path, monkeypat
     assert os.environ["SBOM_TEST_DB"] == "scans"
     assert os.environ["SBOM_TEST_KEEP"] == "from-environment"
     sbom_common.load_env_file(tmp_path / "no-such-file")                    # no .env is fine
+
+
+def test_host_mode_reports_docker_being_down(monkeypatch, tmp_path):
+    log = tmp_path / "events.jsonl"
+    monkeypatch.setattr(scan_all, "WAZUH_JSONL", str(log))
+    monkeypatch.setattr(scan_all, "discover_images",
+                        lambda: (_ for _ in ()).throw(SystemExit("'docker images' failed: daemon down")))
+    with pytest.raises(SystemExit):
+        scan_all.main([])
+    [summary] = [json.loads(line) for line in log.read_text().splitlines()]
+    assert (summary["scanner_mode"], summary["run_status"]) == ("host", "error")
+    assert "daemon down" in summary["errors"]

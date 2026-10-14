@@ -34,6 +34,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -48,6 +49,14 @@ from sbom_common import OUT_DIR, get_db
 REG_OUT = OUT_DIR / "registry"   # latest CycloneDX file per registry image
 MAX_ATTEMPTS = 3                 # give up on an image after this many failed passes
 PULL_TIMEOUT = 3600              # seconds
+# Disk space to leave free on Docker's disk after a pull, in GB. While it is scanned an image
+# needs about five times its download size: Docker keeps it unpacked (2-3x the compressed
+# download) and Trivy writes a second, uncompressed copy to scan.
+try:
+    MIN_FREE_GB = float(os.environ.get("SBOM_MIN_FREE_GB", "10"))
+except ValueError:
+    MIN_FREE_GB = 10.0
+SPACE_FACTOR = 5
 UA = {"User-Agent": "sweri-sbom-scanner"}
 
 
@@ -214,6 +223,27 @@ class V2Registry:
             pages += 1
         return names
 
+    def size(self, repo, ref, platform):
+        """Download size in bytes of repo@ref for this platform (layers + config), from the
+        manifest. None if the registry doesn't say."""
+        scope = f"repository:{repo}:pull"
+        with self.get(f"/v2/{repo}/manifests/{ref}", scope, MANIFEST_TYPES) as r:
+            doc = json.load(r)
+        if doc.get("manifests"):                      # multi-platform: find ours
+            os_name, arch = platform.split("/")[:2]
+            mine = [m for m in doc["manifests"]
+                    if (m.get("platform") or {}).get("os") == os_name
+                    and (m.get("platform") or {}).get("architecture") == arch]
+            if not mine:
+                return None
+            with self.get(f"/v2/{repo}/manifests/{mine[0]['digest']}", scope, MANIFEST_TYPES) as r:
+                doc = json.load(r)
+        layers = doc.get("layers")
+        if not layers:
+            return None
+        sizes = [layer.get("size") for layer in layers] + [(doc.get("config") or {}).get("size", 0)]
+        return sum(sizes) if all(isinstance(s, int) for s in sizes) else None
+
     def catalog(self):
         """Every repository in the registry. The login needs permission to list them."""
         names, url, pages = [], "/v2/_catalog?n=1000", 0
@@ -283,6 +313,33 @@ def local_digest(ref):
     return lines[0].split("@", 1)[1] if lines else None
 
 
+def docker_root():
+    """The folder Docker keeps images in, or None if Docker won't say."""
+    try:
+        r = run(["docker", "info", "--format", "{{.DockerRootDir}}"], 60)
+    except subprocess.TimeoutExpired:
+        return None
+    root = r.stdout.strip() if r.returncode == 0 else ""
+    return root if root and os.path.isdir(root) else None
+
+
+def space_problem(size, root):
+    """A message if pulling an image of `size` bytes would leave less than MIN_FREE_GB free
+    on Docker's disk, else None. With an unknown size, only the minimum is checked."""
+    if not root:
+        return None
+    try:
+        free = shutil.disk_usage(root).free
+    except OSError:
+        return None
+    needed = SPACE_FACTOR * (size or 0) + MIN_FREE_GB * 1e9
+    if free >= needed:
+        return None
+    return (f"not enough disk space on {root}: {free / 1e9:.1f} GB free, about "
+            f"{needed / 1e9:.1f} GB needed (image {(size or 0) / 1e9:.1f} GB, plus "
+            f"{MIN_FREE_GB:g} GB kept free)")
+
+
 def remove(ref):
     r = run(["docker", "rmi", ref], 300)
     if r.returncode != 0:
@@ -291,13 +348,24 @@ def remove(ref):
 
 # ---------------------------------------------------------------- one image
 
-def process(db, item, trivy, platform):
-    """Pull, scan + ship (scan_all's code), record, remove. Returns a summary dict."""
+def process(db, item, trivy, platform, size=None, root=None):
+    """Check space, pull, scan + ship (scan_all's code), record, remove. Returns a summary."""
     image, repo, tag, digest, registry = item
     version, db_updated, db_ready = trivy
     done = db["registry_scans"]
     had_it = image_present(image)       # never delete an image someone else put here
     started = time.time()
+
+    short = None if had_it else space_problem(size, root)
+    if short:                           # not the image's fault: try again next pass, no attempt used
+        log(f"  skipped: {short}")
+        done.update_one({"image": image, "digest": digest},
+                        {"$set": {"repo": repo, "tag": tag, "registry": registry,
+                                  "status": "failed", "error": short,
+                                  "last_attempt": datetime.now(timezone.utc)},
+                         "$setOnInsert": {"attempts": 0}},
+                        upsert=True)
+        return {"image": image, "status": "failed", "error": short}
 
     try:
         log(f"  pulling {image}")
@@ -335,7 +403,8 @@ def process(db, item, trivy, platform):
                          "$inc": {"attempts": 1}},
                         upsert=True)
         log(f"  FAILED: {err}")
-        return {"image": image, "status": "failed"}
+        return {"image": image, "status": "failed", "error": err.strip().splitlines()[-1][-300:]
+                if err.strip() else "unknown error"}
 
     finally:
         if not had_it and image_present(image):
@@ -370,10 +439,12 @@ def one_pass(cfg, db, dry_run=False):
 
     clients = {}
     todo = []
+    unlisted = []                       # registries/repositories that couldn't be read
     try:
         entries = repositories(cfg, clients)
     except Exception as e:
         log(f"could not list the repositories in {registry}: {e}")
+        unlisted.append({"image": registry, "status": "unlisted", "error": str(e), "whole": True})
         entries = []
     for entry in entries:
         entry.setdefault("platform", platform)
@@ -387,6 +458,8 @@ def one_pass(cfg, db, dry_run=False):
                 tags = list_tags_v2(entry, clients[reg_name])
         except Exception as e:
             log(f"could not list {entry['repo']} on {reg_name}: {e}")
+            unlisted.append({"image": f"{reg_name}/{entry['repo']}", "status": "unlisted",
+                             "error": str(e)})
             continue
         log(f"{entry['repo']}: {len(tags)} tag(s) in scope")
         for image, repo, tag, digest in tags:
@@ -398,23 +471,38 @@ def one_pass(cfg, db, dry_run=False):
                 continue
             todo.append((image, repo, tag, digest, reg_name))
 
+    if entries and len(unlisted) == len(entries):   # couldn't read any of them
+        for u in unlisted:
+            u["whole"] = True
     log(f"{len(todo)} image(s) not yet scanned")
     if dry_run:
         for image, _, _, digest, _ in todo:
             print(f"  would scan {image}  {digest[:19]}")
-        return []
+        return unlisted
     if not todo:
-        return []
+        return unlisted
 
     trivy = scan_all.prepare_trivy()    # one DB for the whole pass, as in scan_all.py
+    root = docker_root()
     results = []
     for n, item in enumerate(todo, 1):
-        log(f"[{n}/{len(todo)}] {item[0]}")
-        results.append(process(db, item, trivy, platform))
-    return results
+        image, repo, _, digest, reg_name = item
+        size = None
+        if reg_name in clients:
+            try:
+                size = clients[reg_name].size(repo, digest, platform)
+            except Exception:
+                pass                        # size unknown: only the minimum free space is checked
+        log(f"[{n}/{len(todo)}] {image}" + (f"  ({size / 1e9:.1f} GB)" if size else ""))
+        results.append(process(db, item, trivy, platform, size=size, root=root))
+    return unlisted + results
 
 
 def main(argv=None):
+    return scan_all.reported("registry", _main, argv)
+
+
+def _main(argv):
     ap = argparse.ArgumentParser(description="Scan registry images once each, ship changes to Wazuh.")
     ap.add_argument("--config", default="registries.json")
     ap.add_argument("--dry-run", action="store_true", help="list what would be scanned, pull nothing")
@@ -442,8 +530,17 @@ def main(argv=None):
     results = one_pass(cfg, db, dry_run=args.dry_run)
     ok = sum(r["status"] == "ok" for r in results)
     failed = sum(r["status"] == "failed" for r in results)
-    log(f"Pass complete: {ok} scanned, {failed} failed")
-    return 1 if failed else 0
+    unlisted = [r for r in results if r["status"] == "unlisted"]
+    if not args.dry_run:
+        problems = [f"{r['image']}: {r['error']}" for r in results if r.get("error")]
+        if any(r.get("whole") for r in unlisted) or (failed and not ok):
+            status = "error"            # the registry couldn't be read, or no image could be scanned
+        else:
+            status = "failed" if failed or unlisted else "ok"
+        scan_all.report_run("registry", ok, failed + len(unlisted), problems, status=status)
+    log(f"Pass complete: {ok} scanned, {failed} failed"
+        + (f", {len(unlisted)} could not be listed" if unlisted else ""))
+    return 1 if failed or unlisted else 0
 
 
 if __name__ == "__main__":

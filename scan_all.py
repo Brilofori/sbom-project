@@ -373,6 +373,47 @@ def deliver(events, path=None, eps=None):
     return len(events)
 
 
+ERRORS_MAX = 600
+
+
+def reported(mode, run, argv):
+    """Run main(); if it stops on an error, send an "error" summary before stopping, so a
+    crash is never silent. A second scan finding the first still running isn't an error,
+    and neither is --help or a dry run."""
+    argv = sys.argv[1:] if argv is None else argv
+    quiet = "--dry-run" in argv
+    try:
+        return run(argv)
+    except SystemExit as e:
+        if e.code not in (0, None) and not quiet and not str(e.code).startswith(LOCKED):
+            report_run(mode, 0, 0, [str(e.code)], status="error")
+        raise
+    except Exception as e:
+        if not quiet:
+            report_run(mode, 0, 0, [f"crashed: {type(e).__name__}: {e}"], status="error")
+        raise
+
+
+def report_run(mode, scanned, failed, errors=(), status=None, path=None):
+    """Send Wazuh one summary event for the whole run, so a scanner that stops working shows
+    up in the dashboard instead of looking like a quiet day. status: "ok", "failed" (some
+    images failed) or "error" (the run couldn't scan anything). Never raises: a summary
+    that can't be written must not hide the real problem."""
+    if not status:
+        status = "ok" if not failed else "failed" if scanned else "error"
+    errors = "; ".join(errors)
+    if len(errors) > ERRORS_MAX:      # Wazuh drops the rule description past ~1000 characters
+        more = " ... (more in log)"
+        errors = errors[:ERRORS_MAX - len(more)] + more
+    event = {"source": "trivy", "sbom_event": "scan_run", "scanner_mode": mode,
+             "host": HOSTNAME, "run_status": status, "scanned": scanned, "failed": failed,
+             "errors": errors}
+    try:
+        deliver([event], path, eps=0)
+    except OSError:
+        pass
+
+
 def ingest(db, image, sbom_path, host=None, scanner_version=None, db_updated=None,
            wazuh_log=None, eps=None, now=None, extra=None):
     """Parse one Trivy CycloneDX file, deliver changes to Wazuh, then commit state and
@@ -540,6 +581,9 @@ def check_out_dir(out_dir):
         sys.exit(f"Cannot write to {out_dir}: {e}\nFix: sudo chown -R $USER {out_dir}")
 
 
+LOCKED = "Another scan (scan_all.py or scan_registry.py) is already running"
+
+
 def acquire_lock(out_dir):
     """Stop two runs (timer + manual, or host + registry mode) from racing on the same
     state and Wazuh log. Both scanners take this lock."""
@@ -552,13 +596,17 @@ def acquire_lock(out_dir):
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        sys.exit("Another scan (scan_all.py or scan_registry.py) is already running")
+        sys.exit(LOCKED)
     return handle
 
 
 # --------------------------------------------------------------------------- main ---
 
 def main(argv=None):
+    return reported("host", _main, argv)
+
+
+def _main(argv):
     ap = argparse.ArgumentParser(description="Scan images with Trivy and track changes.")
     ap.add_argument("inventory", nargs="?",
                     help="file with one image per line (default: every image on this host)")
@@ -601,11 +649,12 @@ def main(argv=None):
             r = ingest(db, image, sbom_path, scanner_version=version, db_updated=db_updated)
         except ScanError as e:
             print("     scan failed:\n     " + str(e).replace("\n", "\n     "))
-            results.append({"image": image, "error": "scan failed"})
+            results.append({"image": image, "error": "scan failed",
+                            "detail": str(e).strip().splitlines()[-1][-300:] if str(e).strip() else ""})
             continue
         except Exception as e:  # keep going with the other images; state was not committed
             print(f"     failed: {type(e).__name__}: {e}")
-            results.append({"image": image, "error": type(e).__name__})
+            results.append({"image": image, "error": type(e).__name__, "detail": str(e)[-300:]})
             continue
         results.append(r)
         print(f"     {r['packages']} packages ({r['added']} new, {r['changed']} changed, "
@@ -613,6 +662,8 @@ def main(argv=None):
               f"{r['resolved']} resolved)  |  {r['sent']} events to wazuh")
 
     failed = [r for r in results if "error" in r]
+    report_run("host", len(results) - len(failed), len(failed),
+               [f"{r['image']}: {r.get('detail') or r['error']}" for r in failed])
     print(f"\ncomplete  {HOSTNAME}  ({len(results) - len(failed)} ok, {len(failed)} failed)")
     for r in results:
         if "error" in r:

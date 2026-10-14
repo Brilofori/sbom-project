@@ -66,11 +66,13 @@ class MockRegistry(http.server.BaseHTTPRequestHandler):
         tag = url.path.rsplit("/", 1)[-1]
         if tag in INDEXES:
             body = {"mediaType": "application/vnd.oci.image.index.v1+json",
-                    "manifests": [{"platform": p} for p in INDEXES[tag]]}
+                    "manifests": [{"platform": p, "digest": f"sha256:{p['architecture']}"}
+                                  for p in INDEXES[tag]]}
             ctype = body["mediaType"]
         else:
             ctype = "application/vnd.docker.distribution.manifest.v2+json"
-            body = {"mediaType": ctype, "tag": tag}
+            body = {"mediaType": ctype, "tag": tag, "config": {"size": 1000},
+                    "layers": [{"size": 3_000_000_000}, {"size": 2_000_000_000}]}
         self.reply(200, body, [("Content-Type", ctype), ("Docker-Content-Digest", f"sha256:{tag}")])
 
 
@@ -238,7 +240,7 @@ def test_pass_skips_done_and_abandoned_images_and_prepares_trivy_only_when_neede
                                     "attempts": sr.MAX_ATTEMPTS}])
     prepared, processed = [], []
     monkeypatch.setattr(scan_all, "prepare_trivy", lambda: prepared.append(1) or TRIVY)
-    monkeypatch.setattr(sr, "process", lambda db, item, trivy, platform:
+    monkeypatch.setattr(sr, "process", lambda db, item, trivy, platform, size=None, root=None:
                         processed.append(item[0]) or {"status": "ok"})
     cfg = {"repositories": [{"repo": "r/a"}]}
     sr.one_pass(cfg, db)
@@ -267,3 +269,143 @@ def test_old_format_state_is_set_aside_not_crashed_on(monkeypatch, tmp_path):
     assert sr.main(["--config", str(cfg)]) == 0
     assert db.vuln_state_legacy.count_documents({}) == 2                  # kept, not deleted
     assert db.vuln_state.count_documents({}) == 0
+
+
+def test_registry_run_summary_reports_an_unreadable_registry(monkeypatch, tmp_path, wazuh_log):
+    """An expired login must show up in Wazuh as an error, not as a quiet hour."""
+    db = __import__("mongomock").MongoClient().db
+    cfg = tmp_path / "reg.json"
+    cfg.write_text(json.dumps({"registry": "reg.example:5000"}))
+    monkeypatch.setattr(sr, "get_db", lambda: db)
+    monkeypatch.setattr(sr, "OUT_DIR", tmp_path)
+    monkeypatch.setattr(sr, "REG_OUT", tmp_path / "registry")
+    monkeypatch.setattr(scan_all, "WAZUH_JSONL", wazuh_log)
+
+    def refuse(cfg, clients):
+        raise RuntimeError("reg.example:5000 rejected the scanner's login")
+    monkeypatch.setattr(sr, "repositories", refuse)
+    assert sr.main(["--config", str(cfg)]) == 1
+    [summary] = read_events(wazuh_log)
+    assert (summary["sbom_event"], summary["scanner_mode"], summary["run_status"]) == \
+        ("scan_run", "registry", "error")
+    assert "rejected the scanner's login" in summary["errors"]
+
+    assert sr.main(["--config", str(cfg), "--dry-run"]) == 1          # a dry run sends nothing
+    assert len(read_events(wazuh_log)) == 1
+
+
+def test_registry_run_summary_counts_scans_and_failures(monkeypatch, tmp_path, wazuh_log):
+    db = __import__("mongomock").MongoClient().db
+    cfg = tmp_path / "reg.json"
+    cfg.write_text(json.dumps({"repositories": []}))
+    monkeypatch.setattr(sr, "get_db", lambda: db)
+    monkeypatch.setattr(sr, "OUT_DIR", tmp_path)
+    monkeypatch.setattr(sr, "REG_OUT", tmp_path / "registry")
+    monkeypatch.setattr(scan_all, "WAZUH_JSONL", wazuh_log)
+    monkeypatch.setattr(sr, "one_pass", lambda cfg, db, dry_run=False: [
+        {"image": "r/a:1", "status": "ok"}, {"image": "r/a:2", "status": "failed", "error": "pull failed: x"}])
+    assert sr.main(["--config", str(cfg)]) == 1
+    [summary] = read_events(wazuh_log)
+    assert (summary["run_status"], summary["scanned"], summary["failed"]) == ("failed", 1, 1)
+    assert summary["errors"] == "r/a:2: pull failed: x"
+
+
+def test_mongodb_down_is_reported_before_stopping(monkeypatch, tmp_path, wazuh_log):
+    cfg = tmp_path / "reg.json"
+    cfg.write_text(json.dumps({"repositories": []}))
+    monkeypatch.setattr(sr, "OUT_DIR", tmp_path)
+    monkeypatch.setattr(sr, "REG_OUT", tmp_path / "registry")
+    monkeypatch.setattr(scan_all, "WAZUH_JSONL", wazuh_log)
+
+    def down():
+        raise SystemExit("Cannot reach MongoDB at mongodb://db:27017")
+    monkeypatch.setattr(sr, "get_db", down)
+    with pytest.raises(SystemExit):
+        sr.main(["--config", str(cfg)])
+    [summary] = read_events(wazuh_log)
+    assert summary["run_status"] == "error" and "Cannot reach MongoDB" in summary["errors"]
+
+
+def test_size_is_read_from_the_manifest_for_our_platform(registry):
+    assert registry.size("proj/app", "2.0.0", "linux/amd64") == 5_000_001_000
+    assert registry.size("proj/app", "multi", "linux/amd64") == 5_000_001_000  # via the amd64 manifest
+    assert registry.size("proj/app", "armonly", "linux/amd64") is None
+
+
+def test_space_check(monkeypatch, tmp_path):
+    usage = lambda free: (lambda root: SimpleNamespace(free=free * 1e9))  # noqa: E731
+    monkeypatch.setattr(sr, "MIN_FREE_GB", 10)
+    monkeypatch.setattr(sr.shutil, "disk_usage", usage(40))
+    assert sr.space_problem(5e9, str(tmp_path)) is None                   # needs 5*5 + 10 = 35
+    monkeypatch.setattr(sr.shutil, "disk_usage", usage(20))
+    msg = sr.space_problem(5e9, str(tmp_path))
+    assert "20.0 GB free" in msg and "35.0 GB needed" in msg
+    assert sr.space_problem(None, str(tmp_path)) is None                   # unknown size: minimum only
+    assert sr.space_problem(5e9, None) is None                             # Docker's folder unknown
+
+
+def test_full_disk_skips_the_pull_without_using_an_attempt(db, wazuh_log, registry_host, monkeypatch):
+    monkeypatch.setattr(sr, "space_problem", lambda size, root: "not enough disk space")
+    r = sr.process(db, ITEM, TRIVY, "linux/amd64", size=9e9, root="/var/lib/docker")
+    assert (r["status"], r["error"]) == ("failed", "not enough disk space")
+    assert not registry_host.present                                       # never pulled
+    record = db.registry_scans.find_one({"image": ITEM[0]})
+    assert record["attempts"] == 0 and read_events(wazuh_log) == []
+
+
+def _registry_main_env(monkeypatch, tmp_path, wazuh_log, cfg):
+    path = tmp_path / "reg.json"
+    path.write_text(json.dumps(cfg))
+    monkeypatch.setattr(sr, "get_db", lambda: __import__("mongomock").MongoClient().db)
+    monkeypatch.setattr(sr, "OUT_DIR", tmp_path)
+    monkeypatch.setattr(sr, "REG_OUT", tmp_path / "registry")
+    monkeypatch.setattr(scan_all, "WAZUH_JSONL", wazuh_log)
+    return str(path)
+
+
+def test_a_crash_mid_run_is_still_reported(monkeypatch, tmp_path, wazuh_log):
+    cfg = _registry_main_env(monkeypatch, tmp_path, wazuh_log, {"repositories": []})
+
+    def crash(cfg, db, dry_run=False):
+        raise ConnectionError("MongoDB went away")
+    monkeypatch.setattr(sr, "one_pass", crash)
+    with pytest.raises(ConnectionError):
+        sr.main(["--config", cfg])
+    [summary] = read_events(wazuh_log)
+    assert summary["run_status"] == "error" and "MongoDB went away" in summary["errors"]
+
+
+def test_one_unreadable_repository_is_a_failure_not_an_outage(monkeypatch, tmp_path, wazuh_log):
+    cfg = _registry_main_env(monkeypatch, tmp_path, wazuh_log,
+                             {"repositories": [{"repo": "a"}, {"repo": "b"}]})
+
+    def tags(entry):
+        if entry["repo"] == "b":
+            raise RuntimeError("HTTP 401")
+        return []
+    monkeypatch.setattr(sr, "list_tags", tags)
+    assert sr.main(["--config", cfg]) == 1
+    [summary] = read_events(wazuh_log)
+    assert (summary["run_status"], summary["failed"]) == ("failed", 1)
+    assert "b: HTTP 401" in summary["errors"]
+
+
+def test_another_scan_running_and_dry_runs_send_no_summary(monkeypatch, tmp_path, wazuh_log):
+    cfg = _registry_main_env(monkeypatch, tmp_path, wazuh_log, {"repositories": []})
+
+    def busy(out_dir):
+        raise SystemExit(scan_all.LOCKED)
+    monkeypatch.setattr(scan_all, "acquire_lock", busy)
+    with pytest.raises(SystemExit):
+        sr.main(["--config", cfg])
+    monkeypatch.setattr(sr, "one_pass", lambda cfg, db, dry_run=False: 1 / 0)
+    with pytest.raises(ZeroDivisionError):
+        sr.main(["--config", cfg, "--dry-run"])
+    assert read_events(wazuh_log) == []
+
+
+def test_long_error_lists_are_cut_to_fit_a_wazuh_alert(wazuh_log):
+    scan_all.report_run("registry", 0, 5, [f"img{i}: " + "x" * 300 for i in range(5)], path=wazuh_log)
+    [summary] = read_events(wazuh_log)
+    assert len(summary["errors"]) <= scan_all.ERRORS_MAX and summary["errors"].endswith("(more in log)")
+    assert summary["run_status"] == "error"                       # nothing scanned at all

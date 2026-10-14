@@ -69,4 +69,29 @@
     <group>sbom_vulnerability,</group>
   </rule>
 
+  <!-- One summary per scanner run: shows the scanner is alive -->
+  <rule id="100208" level="3">
+    <if_sid>100200</if_sid>
+    <field name="sbom_event">^scan_run$</field>
+    <description>SBOM scanner run on $(host) ($(scanner_mode) mode): $(scanned) scanned, $(failed) failed</description>
+    <group>sbom_health,</group>
+  </rule>
+
+  <!-- Some images failed to scan; the run carried on with the rest -->
+  <rule id="100209" level="7">
+    <if_sid>100208</if_sid>
+    <field name="run_status">^failed$</field>
+    <description>SBOM scanner on $(host): $(failed) image(s) failed to scan: $(errors)</description>
+    <group>sbom_health,</group>
+  </rule>
+
+  <!-- The run couldn't scan at all: MongoDB unreachable, or the registry couldn't be read
+       (often an expired or wrong login) -->
+  <rule id="100210" level="10">
+    <if_sid>100208</if_sid>
+    <field name="run_status">^error$</field>
+    <description>SBOM scanner on $(host) could not run: $(errors)</description>
+    <group>sbom_health,</group>
+  </rule>
+
 </group>

@@ -3,7 +3,7 @@
 # On the scanning machine (install these yourself; pip doesn't):
 #   - Docker, with the scanner's user in the "docker" group
 #   - Python 3.10 or newer, and git
-#   - Free disk space of about twice the size of the largest image to be scanned
+#   - Free disk space of about five times the size of the largest image, plus 10 GB
 #   - A Wazuh agent connected to the Wazuh manager
 #   - Network access to:
 #       the container registry (usually port 443)

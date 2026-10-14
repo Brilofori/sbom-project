@@ -88,8 +88,11 @@ Follow these steps on the scanning machine unless a step says otherwise.
 
 **Step 1. Check the machine has what it needs.**
 Docker, git and Python 3.10 or newer, plus network access to the registry, MongoDB and the
-Wazuh manager. Allow free disk space of about twice the size of the largest image, because
-each image is pulled there to be scanned. The full list, including network ports, is at the
+Wazuh manager. Allow free disk space of about five times the download size of the largest
+image, plus 10 GB: Docker keeps each image unpacked while it is scanned, and Trivy makes a
+second copy to scan. For registries that report image sizes (most private registries, not
+Docker Hub), registry mode checks this before each download and skips an image that
+wouldn't fit. The full list, including network ports, is at the
 top of `requirements.txt`.
 
 **Step 2. Create a user for the scanner and give it access to Docker.**
@@ -140,7 +143,7 @@ inside `<ossec_config>`, then run `sudo systemctl restart wazuh-agent`.
 
 **Step 8. Install the alert rules on the Wazuh manager.** On the manager:
 ```bash
-sudo grep -rn 'id="1002' /var/ossec/etc/rules/       # rule IDs 100200-100207 must be free
+sudo grep -rn 'id="1002' /var/ossec/etc/rules/       # rule IDs 100200-100210 must be free
 sudo cp sbom_rules.xml /var/ossec/etc/rules/sbom_rules.xml
 sudo chown wazuh:wazuh /var/ossec/etc/rules/sbom_rules.xml
 sudo /var/ossec/bin/wazuh-analysisd -t && sudo systemctl restart wazuh-manager
@@ -305,6 +308,24 @@ Each vulnerability alert also says why it is new, in the `cause` field:
 Registry-mode alerts also carry `scanner_mode: "registry"`, the `registry` and the image's
 `digest`.
 
+**Every run also sends one summary,** so you can tell from the dashboard that the scanner is
+working, and see straight away when it isn't:
+
+- **`scan_run`** (rule 100208, level 3): the run finished. It says how many images were
+  scanned (`scanned`) and how many failed (`failed`).
+- The same summary rises to **level 7** (rule 100209) when something went wrong but the run
+  carried on: some images failed to scan, or one image's versions couldn't be listed.
+  `errors` says what and why.
+- It rises to **level 10** (rule 100210) when the run couldn't do its job at all: MongoDB
+  was unreachable, the registry couldn't be read (usually an expired login), every image
+  failed, or the scanner stopped on an unexpected error.
+
+A run that sends findings but no summary was stopped from outside, for example by a
+restart. `errors` is shortened to fit in a Wazuh alert; the full text is in the scanner's
+log.
+In registry mode with nothing new to scan, the summary is the only alert, which is how a
+quiet hour can be told apart from a broken scanner.
+
 **Severity** is the one Trivy reports. It takes the rating from the package's own
 distribution first (for example Debian's rating for a Debian package), then GitHub's
 advisory database, then the US National Vulnerability Database (NVD). `max_severity` is the worst
@@ -377,9 +398,23 @@ on the command line takes priority, for example `SBOM_DB=test python3 scan_all.p
   set this to the result.
 - **`SBOM_TRIVY_CACHE`**: the Docker volume holding Trivy's vulnerability database. Default
   `trivy-cache`.
+- **`SBOM_MIN_FREE_GB`**: disk space registry mode always leaves free on Docker's disk, in
+  GB. Default 10. Before each download it checks there is room for about five times the
+  image's download size on top of this, and skips the image if not. When the registry
+  doesn't report a size, only this minimum is checked.
 
 
 ## When something goes wrong
+
+Problems during a run show up in Wazuh as rule 100209 (some images failed) or 100210 (the
+run couldn't scan at all), with the reason in `data.errors`. The scanner's own log has the
+detail: `/var/log/sbom/registry.log` for registry mode, or `journalctl -u sbom-scan.service`
+for host mode.
+
+**"not enough disk space"**
+Docker's disk doesn't have room for the image. Free some space (for example
+`docker image prune`), or lower `SBOM_MIN_FREE_GB` if the 10 GB margin is more than this
+machine needs. The image is tried again on the next run.
 
 **"permission denied … Docker daemon socket"**
 The scanner's user isn't in the `docker` group, or hasn't logged in again since being added
@@ -402,7 +437,7 @@ The image took longer than 30 minutes to scan. Raise `--timeout` in `scan_image`
 
 **Alerts are in the log file but not in the dashboard**
 On the manager, run `sudo /var/ossec/bin/wazuh-logtest` and paste one line from
-`/var/log/sbom/trivy-findings.jsonl`. It should match a rule between 100201 and 100207. If
+`/var/log/sbom/trivy-findings.jsonl`. It should match a rule between 100201 and 100210. If
 it doesn't, the rules aren't installed (installation step 8). On the scanning machine, check
 the agent with `grep -i sbom /var/ossec/logs/ossec.log`.
 
