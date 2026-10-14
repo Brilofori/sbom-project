@@ -5,7 +5,8 @@ scan_registry.py - registry mode for the SWERI SBOM pipeline.
 Instead of scanning the images on this host, this watches container registries.
 Each pass it:
 
-  1. lists the tags in every repository named in registries.json
+  1. lists the tags in every repository in the registry (or only those named in
+     registries.json)
   2. skips any image (tag + digest) that has already been scanned
   3. pulls one image, then scans it and ships the changes to Wazuh exactly as
      scan_all.py does (same Trivy, parsing, change tracking and events), then
@@ -213,6 +214,16 @@ class V2Registry:
             pages += 1
         return names
 
+    def catalog(self):
+        """Every repository in the registry. The login needs permission to list them."""
+        names, url, pages = [], "/v2/_catalog?n=1000", 0
+        while url and pages < 100:
+            with self.get(url, "registry:catalog:*") as r:
+                names += json.load(r).get("repositories") or []
+                url = next_link(r.headers.get("Link"), self.base)
+            pages += 1
+        return names
+
     def digest(self, repo, tag, platform):
         """The digest `docker pull` will record for repo:tag, or None if the tag has no image
         for this platform. A single-platform manifest is assumed to match."""
@@ -334,6 +345,24 @@ def process(db, item, trivy, platform):
 
 # ---------------------------------------------------------------- one pass
 
+def repositories(cfg, clients):
+    """The repositories to scan. If the config lists none, every repository in the registry,
+    each using the config's own include, exclude and limit, minus any matching exclude_repos."""
+    if "repositories" in cfg:
+        return cfg["repositories"]
+    registry = cfg.get("registry", "docker.io")
+    if registry in DOCKER_HUB:
+        raise RuntimeError("Docker Hub can't list all its repositories; "
+                           "name them under \"repositories\" in the config")
+    if registry not in clients:
+        clients[registry] = V2Registry(registry, cfg.get("insecure", False))
+    skip = re.compile(cfg["exclude_repos"]) if cfg.get("exclude_repos") else None
+    names = [n for n in clients[registry].catalog() if not (skip and skip.search(n))]
+    log(f"{registry}: {len(names)} repositories found")
+    shared = {k: cfg[k] for k in ("include", "exclude", "limit") if k in cfg}
+    return [{"repo": n, **shared} for n in sorted(names)]
+
+
 def one_pass(cfg, db, dry_run=False):
     registry = cfg.get("registry", "docker.io")
     platform = cfg.get("platform", "linux/amd64")
@@ -341,7 +370,12 @@ def one_pass(cfg, db, dry_run=False):
 
     clients = {}
     todo = []
-    for entry in cfg["repositories"]:
+    try:
+        entries = repositories(cfg, clients)
+    except Exception as e:
+        log(f"could not list the repositories in {registry}: {e}")
+        entries = []
+    for entry in entries:
         entry.setdefault("platform", platform)
         reg_name = entry.get("registry", registry)
         try:
@@ -386,8 +420,12 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", help="list what would be scanned, pull nothing")
     args = ap.parse_args(argv)
 
-    with open(args.config) as f:
-        cfg = json.load(f)
+    try:
+        with open(args.config) as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        sys.exit(f"No {args.config}. Create it from the example:  cp registries.example.json "
+                 "registries.json  then put the registry's address in it (README, \"Setting it up\").")
 
     if not args.dry_run:
         lock = scan_all.acquire_lock(OUT_DIR)  # noqa: F841 (held until exit; shared with scan_all.py)

@@ -52,12 +52,13 @@ No code needs to change. Setting up means telling the pipeline where each part i
 are the six things to set, and where each one goes.
 
 **1. The registry to scan.**
-In `registries.json`, the `registry` line. Give the address without `https://`, for
+In `registries.json`, the `registry` line. (`registries.json` starts as a copy of
+`registries.example.json`.) Give the address without `https://`, for
 example `"registry": "registry.example.com"` or `"registry": "10.0.0.4:5000"`.
 
 **2. Which images to scan in it.**
-In `registries.json`, the `repositories` list: one entry per image, with which versions to
-scan. See [Choosing what to scan](#choosing-what-to-scan).
+Nothing to do: by default every image in the registry is scanned, the newest two versions
+of each. To scan only some, see [Choosing what to scan](#choosing-what-to-scan).
 
 **3. The login for the registry.**
 On the scanning machine, logged in as the user that runs the scanner, run
@@ -113,6 +114,7 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 chmod 600 .env
+cp registries.example.json registries.json
 ```
 Then edit `.env` and `registries.json` as described in
 [Setting it up on a new site](#setting-it-up-on-a-new-site).
@@ -171,44 +173,66 @@ use `sbom-scan.service` and `sbom-scan.timer` in the same way; that runs nightly
 
 ## Choosing what to scan
 
-`registries.json` lists the images to scan. An example:
+By default the scanner finds every image in the registry by itself. `registries.json` only
+needs the registry's address:
 
 ```json
 {
   "registry": "registry.example.com",
   "platform": "linux/amd64",
+  "include": "^\\d+\\.\\d+\\.\\d+$",
+  "limit": 2
+}
+```
+
+On each run it asks the registry for its full list of images, and scans the two newest
+versions of each one. New images added to the registry are picked up on the next run, with
+no change to the file.
+
+- **`registry`** is the registry's address, without `https://`.
+- **`platform`** is the type of processor the images are built for: `linux/amd64` for
+  ordinary Intel and AMD servers, `linux/arm64` for ARM. Versions with no image for it are
+  skipped.
+- **`include`** chooses which versions (tags) count. `^\\d+\\.\\d+\\.\\d+$` matches
+  plain version numbers such as `1.4.2`, and so skips tags like `latest` or `dev`. Leave it
+  out to consider every tag.
+- **`exclude`** skips versions, in the same way. For example `"exclude": "-rc"` skips
+  release candidates.
+- **`limit`** is how many versions to scan per image, newest first. The default is 5.
+- **`exclude_repos`** skips whole images by name. For example `"exclude_repos": "^test/"`
+  skips everything under `test/`.
+- **`insecure`** is only for a registry without HTTPS, such as a test setup. Docker on the
+  scanning machine then also needs the registry listed under `insecure-registries` in
+  `/etc/docker/daemon.json`. Leave it out otherwise.
+
+`include`, `exclude` and `exclude_repos` are regular expressions, and the backslashes are
+doubled because the file is JSON. "Newest" means the highest version number, so `1.10`
+counts as newer than `1.9`. After changing the file, run `python3 scan_registry.py --dry-run`
+to see what it selects.
+
+**Finding every image needs permission to list them.** The registry login must be allowed
+to see the registry's list of images, not only to download them. If it isn't, the dry run
+says it could not list the repositories. Either give the account that permission, or name
+the images instead, as below.
+
+**Naming the images instead.** To scan only certain images, list them under
+`repositories`. Each entry can have its own `include`, `exclude` and `limit`, and its own
+`registry`, so one file can cover several registries:
+
+```json
+{
+  "registry": "registry.example.com",
   "repositories": [
-    {"repo": "ml/inference-server", "include": "^\\d+\\.\\d+\\.\\d+$", "limit": 3},
+    {"repo": "ml/inference-server", "limit": 3},
     {"repo": "ml/trainer", "exclude": "-rc", "limit": 2}
   ]
 }
 ```
 
-This scans the three newest versions of `ml/inference-server` and the two newest of
-`ml/trainer`, ignoring any version with `-rc` in its name.
-
-- **`registry`** is the registry's address. `docker.io` means Docker Hub, which limits how
-  often anonymous users can download, so run `docker login` with a free Docker Hub account
-  when scanning from it. An entry in
-  `repositories` can give its own `registry` too, so one file can cover several registries.
-- **`platform`** is the type of processor the images are built for: `linux/amd64` for
-  ordinary Intel and AMD servers, `linux/arm64` for ARM. Versions with no image for it are
-  skipped.
-- **`repo`** is the image's name as the registry shows it, without the registry address or
-  a version.
-- **`include`** chooses which versions (tags) to scan. `^\\d+\\.\\d+\\.\\d+$` matches plain
-  version numbers such as `1.4.2`, and so skips tags like `latest` or `dev`. Leave it out to
-  consider every tag.
-- **`exclude`** skips versions, in the same way. `-rc` skips release candidates.
-- **`limit`** is how many versions to scan per image, newest first. The default is 5.
-- **`insecure`** is only for a registry without HTTPS, such as a test setup. Docker on the
-  scanning machine then also needs the registry listed under `insecure-registries` in
-  `/etc/docker/daemon.json`. Leave it out otherwise.
-
-`include` and `exclude` are regular expressions, and the backslashes are doubled because the
-file is JSON. "Newest" means the highest version number, so `1.10` counts as newer than
-`1.9`. After changing the file, run `python3 scan_registry.py --dry-run` to see what it
-selects.
+`repo` is the image's name as the registry shows it, without the registry address or a
+version. Docker Hub can't list all its images, so scanning from Docker Hub always needs a
+`repositories` list; it also limits how often anonymous users can download, so run
+`docker login` with a free Docker Hub account.
 
 **Registries with their own certificate authority.** If the registry's HTTPS certificate is
 issued by an internal certificate authority, install that authority's certificate for Docker
@@ -432,7 +456,8 @@ tail -n 3 /var/log/sbom/trivy-findings.jsonl | python3 -m json.tool --json-lines
 
 - `scan_registry.py`: registry mode.
 - `scan_all.py`: host mode, and the scanning and change-tracking code both modes use.
-- `registries.json`: which registry and images registry mode scans.
+- `registries.example.json`: the template for `registries.json`, which says which registry
+  registry mode scans.
 - `.env.example`: the template for this machine's settings.
 - `export_cyclonedx.py`: the combined SBOM described under
   [Running it by hand](#running-it-by-hand).

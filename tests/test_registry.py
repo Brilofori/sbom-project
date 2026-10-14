@@ -17,6 +17,7 @@ from sbom_common import redact
 
 TAGS = ["1.9.0", "1.10.0", "1.10.0-rc1", "2.0.0", "latest"]
 CREDS = ("robot$scanner", "tok3n")
+REPOS = ["proj/app", "proj/worker", "test/scratch"]
 AMD = {"os": "linux", "architecture": "amd64"}
 ARM = {"os": "linux", "architecture": "arm64"}
 INDEXES = {"multi": [AMD, ARM], "armonly": [ARM]}   # tags served as multi-platform indexes
@@ -44,11 +45,18 @@ class MockRegistry(http.server.BaseHTTPRequestHandler):
         if url.path == "/token":
             MockRegistry.token_requests += 1
             good = "Basic " + base64.b64encode(":".join(CREDS).encode()).decode()
-            ok = self.headers.get("Authorization") == good and q["scope"] == ["repository:proj/app:pull"]
+            ok = self.headers.get("Authorization") == good and \
+                q["scope"][0] in ("repository:proj/app:pull", "registry:catalog:*")
             return self.reply(200, {"token": "T0K"}) if ok else self.reply(401)
         if self.headers.get("Authorization") != "Bearer T0K":
             return self.reply(401, headers=[("WWW-Authenticate",
                               f'Bearer realm="http://127.0.0.1:{port}/token",service="harbor-registry"')])
+        if url.path == "/v2/_catalog":                     # two repositories per page
+            start = REPOS.index(q["last"][0]) + 1 if "last" in q else 0
+            page = REPOS[start:start + 2]
+            link = [("Link", f'</v2/_catalog?n=2&last={page[-1]}>; rel="next"')] \
+                if start + 2 < len(REPOS) else []
+            return self.reply(200, {"repositories": page}, link)
         if url.path == "/v2/proj/app/tags/list":
             start = TAGS.index(q["last"][0]) + 1 if "last" in q else 0
             page = TAGS[start:start + 2]
@@ -99,6 +107,33 @@ def test_v2_wrong_login_says_so(registry):
     registry.creds = ("robot$scanner", "wrong")
     with pytest.raises(RuntimeError, match="token request refused"):
         registry.tags("proj/app")
+
+
+def test_catalog_lists_every_repository(registry):
+    assert registry.catalog() == REPOS
+
+
+def test_no_repositories_in_the_config_means_every_repository(registry):
+    cfg = {"registry": registry.host, "include": r"^\d+\.\d+\.\d+$", "limit": 2,
+           "exclude_repos": "^test/"}
+    entries = sr.repositories(cfg, {registry.host: registry})
+    assert entries == [{"repo": "proj/app", "include": r"^\d+\.\d+\.\d+$", "limit": 2},
+                       {"repo": "proj/worker", "include": r"^\d+\.\d+\.\d+$", "limit": 2}]
+    listed = sr.list_tags_v2({**entries[0], "platform": "linux/amd64"}, registry)
+    assert [t[2] for t in listed] == ["2.0.0", "1.10.0"]              # the shared filter applies
+
+
+def test_a_named_list_still_wins_and_docker_hub_needs_one(registry):
+    named = [{"repo": "proj/app"}]
+    assert sr.repositories({"registry": registry.host, "repositories": named}, {}) is named
+    with pytest.raises(RuntimeError, match="name them"):
+        sr.repositories({"registry": "docker.io"}, {})
+
+
+def test_missing_config_says_how_to_create_it(tmp_path):
+    with pytest.raises(SystemExit) as e:
+        sr.main(["--config", str(tmp_path / "registries.json")])
+    assert "cp registries.example.json registries.json" in str(e.value)
 
 
 def test_creds_come_from_docker_login(tmp_path, monkeypatch):

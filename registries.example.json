@@ -1,0 +1,6 @@
+{
+  "registry": "REGISTRY-ADDRESS",
+  "platform": "linux/amd64",
+  "include": "^\\d+\\.\\d+\\.\\d+$",
+  "limit": 2
+}
