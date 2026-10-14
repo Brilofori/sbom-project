@@ -1,370 +1,459 @@
-# Container SBOM pipeline
+# Container SBOM Pipeline
 
-Builds a software bill of materials (SBOM) for container images, tracks what changes
-between scans, and puts the container inventory and its vulnerabilities into Wazuh next to
-the host inventory that Syscollector already collects.
+Scans container images for the software packages inside them and the known
+vulnerabilities in those packages, keeps a record of every image, and sends Wazuh an
+alert whenever something changes.
 
-It runs in two modes that share the same Trivy pin, event format and Wazuh rules:
+Wazuh already records the software installed on each machine. It does not look inside
+container images. This pipeline fills that gap, so container packages and their
+vulnerabilities appear in the same Wazuh dashboard as everything else.
 
-- **Registry mode** (`scan_registry.py`): lists tags in container registries, pulls each
-  image once, scans it, sends the findings to Wazuh and deletes the image. Runs hourly.
-  See [Registry mode](#registry-mode).
-- **Host mode** (`scan_all.py`): scans the images already on a host. Runs nightly.
 
-Built for SWERI's Software Supply Chain Security placement (INFO3017, Group 8, 2026).
+## How it works
+
+Four parts work together. They can sit on one machine or on several, as long as they can
+reach each other over the network.
 
 ```
-docker images ──► Trivy (pinned, cached DB) ──► out/<image>.json   CycloneDX SBOM per image
-                                                     │
-                                     scan_all.py compares it with the state in MongoDB
-                                                     │
-                  ┌────────── only what changed ─────┴─────── every scan ───────────┐
-                  ▼                                                                  ▼
-   /var/log/sbom/trivy-findings.jsonl                                 MongoDB  sweri_sbom
-                  │  Wazuh agent (localfile)                                         │
-                  ▼                                                                  ▼
-   Wazuh manager, rules 100200-100207 ──► dashboard       reports, consolidated SBOM
+  Container registry ──images──►  Scanning machine  ──results──►  MongoDB
+  (where the images are)          (runs this code,
+                                   Docker and Trivy)  ──alerts───►  Wazuh manager
 ```
 
-Wazuh only receives changes. A nightly scan sends nothing unless something changed:
-a package, the image, or a newly published CVE. The first scan of an image sends its full
-inventory once (the *baseline*).
+- **Container registry.** Where the images are stored, such as Harbor, Azure Container
+  Registry, GitLab or Docker Hub.
+- **Scanning machine.** Runs this code. For each image it pulls the image, has
+  [Trivy](https://trivy.dev) list every package and vulnerability in it, then deletes the
+  image again.
+- **MongoDB.** Keeps every scan and remembers what each image contained last time.
+- **Wazuh manager.** Receives an alert for each change, through the Wazuh agent on the
+  scanning machine.
 
-## Contents
+**Only changes are sent to Wazuh.** The first scan of an image sends its full contents once.
+After that, Wazuh hears about an image only when something changes: a package is added,
+removed or upgraded, the image is rebuilt, or a new vulnerability is published that affects
+it. A scan that finds nothing new sends nothing.
 
-| File | Purpose |
-|---|---|
-| `scan_registry.py` | Registry mode. Lists registry tags, then pulls, scans (with `scan_all.py`'s code) and removes one image at a time |
-| `registries.json` | Registry mode config: which repos and tags to scan |
-| `scan_all.py` | Host mode. Scans the images on a host, tracks changes, feeds Wazuh, writes per-image reports |
-| `report.py` | Markdown vulnerability summary for one image |
-| `export_cyclonedx.py` | One consolidated CycloneDX SBOM file for every scanned image (deliverable 3) |
-| `gap_analysis.py` | Wazuh Syscollector (host) vs Trivy (container) inventory comparison (deliverable 4) |
-| `sbom_common.py` | Shared settings and helpers; reads `.env` |
-| `.env.example` | Template for the machine's settings (copy to `.env`) |
-| `wazuh/sbom_rules.xml` | Manager rules for the pipeline's events |
-| `wazuh/agent_localfile_block.xml` | Agent config that reads the event log |
-| `deploy/` | systemd units (`sbom-registry.*` hourly, `sbom-scan.*` nightly); logrotate config |
-| `tests/` | Unit tests (`python3 -m pytest`) |
+### Two ways to run it
 
-## Setup (once per host)
+- **Registry mode** (`scan_registry.py`) scans images straight from a registry. It pulls one
+  image at a time, scans it and deletes it, so the scanning machine never stores more than
+  one image. Images that were already on the machine are never deleted. An image is scanned once, and again only when it is rebuilt. Runs hourly.
+- **Host mode** (`scan_all.py`) scans the images already on the scanning machine. It
+  re-scans all of them each time, which is how it notices newly published vulnerabilities
+  in images that haven't changed. Runs nightly.
 
-Run these steps on the host whose images you want scanned, unless a step says otherwise.
-The lab host is `sweri-node-01`.
+Both produce the same results and alerts, and can run on the same machine.
 
-**1. Prerequisites.** You need Docker, Python 3.10 or newer, and git. The user that runs
-the pipeline must be in the `docker` group. That gives it root-equivalent access, so use a
-dedicated user if you can.
+
+## Setting it up on a new site
+
+No code needs to change. Setting up means telling the pipeline where each part is. These
+are the six things to set, and where each one goes.
+
+**1. The registry to scan.**
+In `registries.json`, the `registry` line. Give the address without `https://`, for
+example `"registry": "registry.example.com"` or `"registry": "10.0.0.4:5000"`.
+
+**2. Which images to scan in it.**
+In `registries.json`, the `repositories` list: one entry per image, with which versions to
+scan. See [Choosing what to scan](#choosing-what-to-scan).
+
+**3. The login for the registry.**
+On the scanning machine, logged in as the user that runs the scanner, run
+`docker login registry.example.com` with a read-only account. The scanner reuses that
+saved login.
+
+**4. Where MongoDB is.**
+In `.env`, the `SBOM_MONGO_URI` line. Leave it alone if MongoDB runs on the scanning
+machine. Otherwise give its address, for example `SBOM_MONGO_URI=mongodb://10.0.0.5:27017`.
+
+**5. Which database to use in MongoDB.**
+In `.env`, the `SBOM_DB` line. The default is `sweri_sbom`. Choose another name if that one
+is already used for something else.
+
+**6. Where Wazuh is.**
+This is set in the Wazuh agent on the scanning machine, not in this code: the
+`<server><address>` line in `/var/ossec/etc/ossec.conf`. It is normally filled in when the
+agent is installed.
+
+`.env` starts as a copy of `.env.example`, which explains each setting. Everything else has
+a working default; the full list is under [All settings](#all-settings).
+
+
+## Installing
+
+Follow these steps on the scanning machine unless a step says otherwise.
+
+**Step 1. Check the machine has what it needs.**
+Docker, git and Python 3.10 or newer, plus network access to the registry, MongoDB and the
+Wazuh manager. Allow free disk space of about twice the size of the largest image, because
+each image is pulled there to be scanned. The full list, including network ports, is at the
+top of `requirements.txt`.
+
+**Step 2. Create a user for the scanner and give it access to Docker.**
 ```bash
-sudo usermod -aG docker $USER        # then log out and back in
-git clone https://github.com/Brilofori/sbom-project.git && cd sbom-project
+sudo useradd -m sbom
+sudo usermod -aG docker sbom
+sudo mkdir /opt/sbom-project && sudo chown sbom /opt/sbom-project
+```
+Membership of the `docker` group gives full control of Docker, which is equivalent to root
+access. Use this account only for the scanner.
+
+**Step 3. Get the code and the Python packages.** Switch to the `sbom` user with
+`sudo -iu sbom`, and do the rest of the installation as that user unless a step uses
+`sudo`.
+```bash
+git clone <repository-url> /opt/sbom-project
+cd /opt/sbom-project
 pip install -r requirements.txt
-cp .env.example .env && chmod 600 .env    # this machine's settings; see Configuration
 ```
 
-**2. MongoDB.** If the machine already runs MongoDB, skip this step and put its address in
-`.env` (`SBOM_MONGO_URI`) unless it is on localhost without a password. Otherwise, start one
-bound to localhost only, with its data in a named volume and the version pinned. Docker's `-p 27017:27017` publishes on every interface and bypasses UFW, and
-this MongoDB has no authentication.
+**Step 4. Fill in the settings.**
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+Then edit `.env` and `registries.json` as described in
+[Setting it up on a new site](#setting-it-up-on-a-new-site).
+
+**Step 5. Start MongoDB, unless the site already has one.**
 ```bash
 docker run -d --name mongodb --restart unless-stopped \
   -p 127.0.0.1:27017:27017 -v sbom-mongo-data:/data/db mongo:8.0
 ```
+This MongoDB has no password, so it only accepts connections from the same machine
+(`127.0.0.1`). If the site already runs MongoDB, skip this step and put its address in
+`.env` instead.
 
-**3. Trivy image.** `scan_all.py` runs Trivy 0.74.0, pinned by digest (`TRIVY_IMAGE`). The
-first run pulls it if it isn't present. To check it:
+**Step 6. Create the folder for the Wazuh alerts.**
 ```bash
-docker run --rm aquasec/trivy@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969 --version
-```
-To move to a new Trivy release, review it first (see the Trivy Security Assessment,
-deliverable 2). Then get its digest with
-`docker image inspect aquasec/trivy:<version> --format '{{index .RepoDigests 0}}'` and
-either update `TRIVY_IMAGE` or set `SBOM_TRIVY_IMAGE`.
-
-**4. Event log directory.** The pipeline writes Wazuh events here.
-```bash
-sudo mkdir -p /var/log/sbom && sudo chown $USER /var/log/sbom
+sudo mkdir -p /var/log/sbom
+sudo chown sbom /var/log/sbom
 ```
 
-**5. Wazuh agent (this host).** Add the block from `wazuh/agent_localfile_block.xml` inside
-`<ossec_config>` in `/var/ossec/etc/ossec.conf`, then run `sudo systemctl restart wazuh-agent`.
+**Step 7. Tell the Wazuh agent to read the alerts.**
+Copy the block from `wazuh/agent_localfile_block.xml` into `/var/ossec/etc/ossec.conf`,
+inside `<ossec_config>`, then run `sudo systemctl restart wazuh-agent`.
 
-**6. Wazuh manager.** Install the rules, check the syntax, and restart:
+**Step 8. Install the alert rules on the Wazuh manager.** On the manager:
 ```bash
-sudo cp wazuh/sbom_rules.xml /var/ossec/etc/rules/sbom_rules.xml
+sudo grep -rn 'id="1002' /var/ossec/etc/rules/       # rule IDs 100200-100207 must be free
+sudo cp sbom_rules.xml /var/ossec/etc/rules/sbom_rules.xml
 sudo chown wazuh:wazuh /var/ossec/etc/rules/sbom_rules.xml
 sudo /var/ossec/bin/wazuh-analysisd -t && sudo systemctl restart wazuh-manager
 ```
-If these rules were ever pasted into `local_rules.xml`, delete them from there first.
-Duplicate rule IDs stop `wazuh-analysisd` from starting.
+The rules file is `wazuh/sbom_rules.xml` in this repository; copy it to the manager first.
+If the first command finds rules already using those IDs, the IDs in `sbom_rules.xml` need
+changing before it is installed.
 
-**7. First run.** Run `python3 scan_all.py`. See [Running](#running).
-
-**8. Schedule it.** Use the systemd timer in `deploy/`. It runs nightly at about 02:30,
-and catches up after the machine was off:
+**Step 9. Check the settings, then run a first scan.**
 ```bash
-# edit User= and the paths in deploy/sbom-scan.service first
-sudo cp deploy/sbom-scan.service deploy/sbom-scan.timer /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now sbom-scan.timer
-systemctl list-timers sbom-scan.timer          # next run
-journalctl -u sbom-scan.service                # output of past runs
+python3 scan_registry.py --dry-run
+python3 scan_registry.py
 ```
-Cron works too: `30 2 * * * cd /home/<user>/sbom-project && /usr/bin/python3 scan_all.py >> /var/log/sbom/pipeline.log 2>&1`.
+The dry run lists every image that would be scanned, without downloading anything. A wrong
+address, login or certificate shows up here. The second command scans for real.
 
-**9. Log rotation.** Run `sudo cp deploy/logrotate-sbom /etc/logrotate.d/sbom`. It rotates by
-renaming the file. Never use `copytruncate` on the event log: truncating a file Wazuh
-monitors fires rule 592, "Log file size reduced" (level 8), on every rotation.
-
-## Running
-
+**Step 10. Schedule it.**
+In `deploy/sbom-registry.service`, check the `User=` and `WorkingDirectory=` lines match
+steps 2 and 3. Then:
 ```bash
-python3 scan_all.py                     # every tagged image on this host (except Trivy itself)
-python3 scan_all.py images.txt          # only the images listed (one per line, # comments ok)
-python3 scan_all.py --rebaseline        # set state aside and resend the full inventory once
+sudo cp deploy/sbom-registry.service deploy/sbom-registry.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now sbom-registry.timer
+sudo cp deploy/logrotate-sbom /etc/logrotate.d/sbom
 ```
-The run exits 1 if any image failed, so cron and systemd report failures. One broken
-image doesn't stop the others. Only one scan runs at a time, in either mode (both scanners
-take the same lock); a second run exits immediately.
+The scanner now runs five minutes after the machine starts, then every hour. For host mode,
+use `sbom-scan.service` and `sbom-scan.timer` in the same way; that runs nightly at about
+02:30.
 
-Each run does the following:
 
-- Downloads the Trivy vulnerability DB once, into the `trivy-cache` Docker volume, so
-  every image in the run is scanned against the same DB.
-- Scans each image with Trivy and saves the CycloneDX output as `out/<image>.json`. A
-  failed scan keeps the previous good file.
-- Compares the scan with the stored state and appends the changes to the Wazuh event log.
-- Saves the scan and writes `out/report_<image>.md`.
+## Choosing what to scan
 
-Other tools:
-```bash
-python3 report.py python:3.11-slim [out.md]         # vulnerability summary for one image
-python3 export_cyclonedx.py                         # out/sweri-consolidated.cdx.json
-python3 gap_analysis.py wazuh_inventory.txt --image python:3.9-slim
-```
-For `gap_analysis.py`, first export the host inventory on the Wazuh manager. Agent `001` is
-the scanned host; the command is also in the script's header.
-`sudo sqlite3 /var/ossec/queue/db/001.db "SELECT name, version FROM sys_programs;" > wazuh_inventory.txt`
+`registries.json` lists the images to scan. An example:
 
-## Registry mode
-
-`scan_registry.py` scans images straight from container registries, so the scanning host
-doesn't need to keep them. Each pass:
-
-1. Lists the tags of every repo in `registries.json` that match its filters, with the digest
-   each tag points to.
-2. Skips any image + tag + digest already scanned. A tag is scanned again only when it is
-   rebuilt (new digest).
-3. For each new image: pull it, then scan it and send the changes to Wazuh with
-   `scan_all.py`'s own code (same Trivy settings, 30-minute limit, parsing and change
-   tracking), record it, then remove the image. Only one image is on disk at a time, so the
-   host needs free space for the largest image plus Trivy's scratch space (about twice the
-   image size).
-
-Images that were already on the host before the pass are never removed. An image that fails
-is retried on the next pass, up to 3 times.
-
-```bash
-python3 scan_registry.py --dry-run      # list what would be scanned, pull nothing
-python3 scan_registry.py                # one pass
-```
-
-**Config.** Each entry in `registries.json` names a repo and which of its tags to scan:
-```json
-{"repo": "python", "include": "^3\\.\\d+\\.\\d+-slim$", "limit": 5, "platform": "linux/amd64"}
-```
-`include` and `exclude` are regular expressions on the tag, `limit` keeps the newest N
-matching tags. Anonymous Docker Hub pulls are rate-limited, so run `docker login` with a
-free account on the scanning host.
-
-**Private registries.** Any registry that speaks the Docker Registry v2 API works: Harbor,
-GitLab, Nexus, Artifactory, a plain `registry:2`. Set `registry` to its `host:port`; a
-repo entry can also set its own `registry`, so one config can cover several:
 ```json
 {
-  "registry": "registry.sweri.local:5000",
+  "registry": "registry.example.com",
   "platform": "linux/amd64",
   "repositories": [
-    {"repo": "ml/inference-server", "include": "^\\d+\\.\\d+\\.\\d+$", "limit": 5},
-    {"repo": "redis", "registry": "docker.io", "include": "-alpine$", "limit": 2}
+    {"repo": "ml/inference-server", "include": "^\\d+\\.\\d+\\.\\d+$", "limit": 3},
+    {"repo": "ml/trainer", "exclude": "-rc", "limit": 2}
   ]
 }
 ```
-On the scanning host, as the user the scanner runs as:
-1. `docker login registry.sweri.local:5000` with a read-only account (a robot account in
-   Harbor). The scanner reads the same saved login to list tags. If Docker uses a
-   credential helper instead, put `SBOM_REGISTRY_USER` and `SBOM_REGISTRY_PASSWORD` in
-   `.env`.
-2. If the registry's certificate comes from an internal CA, install the CA for both Docker
-   (`/etc/docker/certs.d/registry.sweri.local:5000/ca.crt`) and the OS
-   (`/usr/local/share/ca-certificates/`, then `sudo update-ca-certificates`).
-3. A registry on plain HTTP needs `"insecure": true` in the config and an
-   `insecure-registries` entry in `/etc/docker/daemon.json`. Avoid this outside a lab.
 
-The v2 API lists tags alphabetically with no dates, so "newest" means the highest version
-number (1.10 above 1.9). Use `include` to keep tags like `latest` or `dev-*` out.
-Run `--dry-run` first: it lists the tags and digests without pulling anything, and a bad
-login or certificate shows up there.
+This scans the three newest versions of `ml/inference-server` and the two newest of
+`ml/trainer`, ignoring any version with `-rc` in its name.
 
-**Schedule.** Setup steps 1 to 6 apply here too. Then:
+- **`registry`** is the registry's address. `docker.io` means Docker Hub, which limits how
+  often anonymous users can download, so run `docker login` with a free Docker Hub account
+  when scanning from it. An entry in
+  `repositories` can give its own `registry` too, so one file can cover several registries.
+- **`platform`** is the type of processor the images are built for: `linux/amd64` for
+  ordinary Intel and AMD servers, `linux/arm64` for ARM. Versions with no image for it are
+  skipped.
+- **`repo`** is the image's name as the registry shows it, without the registry address or
+  a version.
+- **`include`** chooses which versions (tags) to scan. `^\\d+\\.\\d+\\.\\d+$` matches plain
+  version numbers such as `1.4.2`, and so skips tags like `latest` or `dev`. Leave it out to
+  consider every tag.
+- **`exclude`** skips versions, in the same way. `-rc` skips release candidates.
+- **`limit`** is how many versions to scan per image, newest first. The default is 5.
+- **`insecure`** is only for a registry without HTTPS, such as a test setup. Docker on the
+  scanning machine then also needs the registry listed under `insecure-registries` in
+  `/etc/docker/daemon.json`. Leave it out otherwise.
+
+`include` and `exclude` are regular expressions, and the backslashes are doubled because the
+file is JSON. "Newest" means the highest version number, so `1.10` counts as newer than
+`1.9`. After changing the file, run `python3 scan_registry.py --dry-run` to see what it
+selects.
+
+**Registries with their own certificate authority.** If the registry's HTTPS certificate is
+issued by an internal certificate authority, install that authority's certificate for Docker
+(`/etc/docker/certs.d/registry.example.com/ca.crt`) and for the operating system
+(`/usr/local/share/ca-certificates/`, then `sudo update-ca-certificates`).
+
+**Logins that expire.** Some registries hand out logins that stop working after a few
+hours, such as the one `az acr login` creates for Azure Container Registry. Use a long-lived
+read-only account instead, for example an ACR token or service principal, or the hourly
+scans will start failing.
+
+
+## Running it by hand
+
+Registry mode:
 ```bash
-sudo cp deploy/sbom-registry.service deploy/sbom-registry.timer /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now sbom-registry.timer
-systemctl list-timers sbom-registry.timer
-tail -f /var/log/sbom/registry.log
+python3 scan_registry.py --dry-run       # show what would be scanned
+python3 scan_registry.py                 # scan once
 ```
-The timer runs 5 minutes after boot, then hourly.
 
-**Events.** Same format and rules as host mode, plus `scanner_mode: "registry"`,
-`registry` and `digest`. In the Wazuh dashboard, `data.scanner_mode:registry` shows only
-registry-mode events; add `and data.sbom_event:component` for one row per package per image.
+Host mode:
+```bash
+python3 scan_all.py                      # every image on this machine
+python3 scan_all.py images.txt           # only the images listed in the file, one per line
+python3 scan_all.py --rebaseline         # forget previous results and resend everything once
+```
 
-**State.** `registry_scans` has one document per image + tag + digest, with its status and
-attempt count; that's what decides what to scan. Everything else is shared with host mode:
-change tracking in `component_state` and `vuln_state`, scans in `scans` (with
-`scanner_mode: "registry"`), the latest CycloneDX file per image in `out/registry/`. So
-`report.py`, `export_cyclonedx.py` and `gap_analysis.py` work on registry images too.
+Only one scan runs at a time. If a scan is already running, in either mode, a second one
+stops straight away. If any image fails, the others still run and the command ends with an
+error, so the scheduler records the failure. In registry mode a failed image is tried again
+on the next run, up to three times.
 
-**Limitation.** An image is scanned once per digest. A CVE published after that scan is not
-reported until the tag is rebuilt. Host mode catches these on its nightly re-scan
-(`cause: db_update`); registry mode doesn't yet.
+**Reports.** These read what is already stored in MongoDB:
+```bash
+python3 report.py python:3.11-slim       # vulnerability summary for one image (Markdown)
+python3 export_cyclonedx.py              # one CycloneDX SBOM file covering every image
+python3 gap_analysis.py wazuh_inventory.txt --image python:3.11-slim
+```
+`gap_analysis.py` compares the packages Wazuh sees on the machine itself with the packages
+inside an image, to show what each one misses. Its input comes from the Wazuh manager:
+```bash
+sudo sqlite3 /var/ossec/queue/db/001.db "SELECT name, version FROM sys_programs;" > wazuh_inventory.txt
+```
+where `001` is the scanning machine's Wazuh agent ID.
 
-## How change detection works
+**Where the files go.** Everything is written to the `out` folder in the repository: the
+latest SBOM of each image (`out/<image>.json`, and `out/registry/` for registry mode), a
+vulnerability report for each image (`out/report_<image>.md`), and the combined SBOM from
+`export_cyclonedx.py` (`out/sweri-consolidated.cdx.json`). A failed scan keeps the previous
+good file.
 
-**Package identity.** State is tracked per host, per image, per *package identity*: the
-purl without its version or qualifiers.
-`pkg:deb/debian/libc6@2.36-9+deb12u7?arch=amd64&distro=debian-12.7` becomes
-`pkg:deb/debian/libc6`. Trivy's purls include the version and the OS point release, so
-tracking on the raw purl would make every base-image refresh look like hundreds of new
-packages and CVEs. With identities, a refresh shows up as a few `component_changed` events.
 
-**Events sent to Wazuh.** Every event has `source: "trivy"`, `host`, `image`, `image_id`,
-`identity`, `package_name` and `timestamp`.
+## What Wazuh receives
 
-| `sbom_event` | Rule | Level | When |
-|---|---|---|---|
-| `component` | 100201 | 3 | A package appears: baseline, newly added, or re-added (`cause`) |
-| `component_changed` | 100205 | 3 | A package's version changed (`previous_version`, then `installed_version`) |
-| `component_removed` | 100206 | 3 | A package is no longer in the image |
-| `vulnerability` | 100202 / 100203 / 100204 | 5 / 10 high / 12 critical | A CVE appears on a package |
-| `vulnerability_resolved` | 100207 | 3 | A reported CVE is gone: fixed, or its package removed |
+Each alert is one line of JSON, written to `/var/log/sbom/trivy-findings.jsonl` and passed
+on by the Wazuh agent. Every alert names the machine (`host`), the image, and the package.
+In the Wazuh dashboard, search for `data.sbom_event` to see them.
 
-**Why a vulnerability is new (`cause`).**
+- **`component`** (rule 100201, level 3): a package is present in an image. Sent for every
+  package on an image's first scan, then whenever a package is added.
+- **`component_changed`** (rule 100205, level 3): a package was upgraded or downgraded. The
+  alert gives the old and new version.
+- **`component_removed`** (rule 100206, level 3): a package is no longer in the image.
+- **`vulnerability`** (rules 100202 to 100204): a vulnerability affects a package in the
+  image. The level depends on severity: 10 for high, 12 for critical, and 5 for anything
+  lower. The alert includes the fixed version, when one exists.
+- **`vulnerability_resolved`** (rule 100207, level 3): a vulnerability reported earlier no
+  longer applies, because the package was fixed or removed.
 
-| `cause` | Meaning |
-|---|---|
-| `baseline` | First scan of this image on this host |
-| `image_changed` | The image was rebuilt or re-pulled since the last scan (different image ID) |
-| `db_update` | Same image ID. Nothing in the image changed; the CVE is newly published or newly matched |
-| `regression` | This CVE was resolved earlier and is back |
+Each vulnerability alert also says why it is new, in the `cause` field:
 
-**Severity.** `severity` is the severity Trivy itself reports. It takes the rating from the
-package's own distribution (e.g. Debian's for a Debian package), then GitHub Advisory for
-GHSA IDs, then NVD. `max_severity` is the worst rating from any source, including other
-distributions' ratings of their own builds. The rules alert on `severity`, so the numbers
-match what `trivy image` shows. To alert on the worst case instead, change the rules to use
-`max_severity`.
+- **`baseline`**: the first scan of this image.
+- **`image_changed`**: the image was rebuilt since the last scan.
+- **`db_update`**: the image is unchanged; the vulnerability was published or matched
+  since the last scan.
+- **`regression`**: this vulnerability was fixed before and has come back.
 
-**Fixes.** `fixed_version` comes from Trivy's `recommendation` field, which is the only
-place Trivy writes it.
+Registry-mode alerts also carry `scanner_mode: "registry"`, the `registry` and the image's
+`digest`.
 
-**Delivery.** Events are written and fsynced before the state is saved. If the write
-fails, nothing is marked as seen, and the next run sends the events again. A crash between
-the write and the save can produce a duplicate, but never loses an event. Writes are
-throttled to 400 lines per second (`SBOM_WAZUH_EPS`). The agent forwards 500 per second by
-default and drops anything beyond its buffer, which matters for the baseline of a large
-image.
+**Severity** is the one Trivy reports. It takes the rating from the package's own
+distribution first (for example Debian's rating for a Debian package), then GitHub's
+advisory database, then the US National Vulnerability Database (NVD). `max_severity` is the worst
+rating from any source, for anyone who prefers to alert on that instead.
 
-## Data in MongoDB (`sweri_sbom`)
 
-| Collection | One document per | Key fields |
-|---|---|---|
-| `scans` | scan | `host`, `image`, `scanned_at`, `scanner_mode`/`registry`/`digest` (registry mode), `image_id`, `os`, `scanner_version`, `db_updated_at`, counts, `components[]`, `vulnerabilities[]` (per CVE+package: `severity`, `max_severity`, `fixed_version`, `is_new`, `cause`), `resolved[]` |
-| `component_state` | host + image + package identity | `versions`, `present`, `first_seen`, `last_seen`, `removed_at` |
-| `vuln_state` | host + image + CVE + package identity | `status` (open/resolved), `severity`, `fixed_version`, `first_seen`, `opened_at`, `resolved_at` |
-| `cve_info` | CVE | `description`, `published`, `updated`, `source` |
-| `registry_scans` | registry image + digest (registry mode only) | `repo`, `tag`, `registry`, `status` (ok/failed), `attempts`, `error`, counts |
+## How changes are recognised
 
-CVE descriptions are stored once in `cve_info` instead of in every scan. This keeps big
-images well under MongoDB's 16MB document limit. If a scan still exceeds the limit, it is
-saved without its per-CVE list and flagged `truncated`.
+Packages are matched by name, not by name and version. Trivy's package identifiers include
+the version, and for system packages even the operating system's point release, so
+`pkg:deb/debian/libc6@2.36-9+deb12u7` changes on every base-image update. The pipeline
+compares `pkg:deb/debian/libc6` instead. That way an update shows up as a few
+`component_changed` alerts rather than hundreds of packages that seem to vanish and
+reappear.
 
-State written by the September 2026 version (keyed on the full purl) is moved aside to
-`vuln_state_legacy` and `component_state_legacy` on the first run, kept rather than deleted,
-and the full inventory is sent once as a new baseline. Both scanners do this.
+**No alert is lost.** Alerts are written to disk before the results are saved. If writing
+fails, nothing is marked as sent, and the next run sends the alerts again. A crash at the
+wrong moment can produce a duplicate alert, never a missing one.
 
-## Configuration
+**Large images don't flood Wazuh.** Alerts are written at up to 400 lines a second, below
+the 500 a second the Wazuh agent forwards by default. The first scan of a large image can
+produce several thousand alerts, which then take a few seconds to send.
 
-| Variable | Default | |
-|---|---|---|
-| `SBOM_MONGO_URI` | `mongodb://localhost:27017` | |
-| `SBOM_DB` | `sweri_sbom` | |
-| `SBOM_OUT_DIR` | `<repo>/out` | SBOM files, reports, lock file |
-| `SBOM_TRIVY_IMAGE` | Trivy 0.74.0 by digest | |
-| `SBOM_TRIVY_CACHE` | `trivy-cache` | Docker volume for Trivy's DB |
-| `SBOM_WAZUH_LOG` | `/var/log/sbom/trivy-findings.jsonl` | Must match the agent's `<location>` |
-| `SBOM_WAZUH_EPS` | `400` | Event lines per second |
-| `SBOM_REGISTRY_USER`, `SBOM_REGISTRY_PASSWORD` | the `docker login` entry | Registry mode, private registries |
 
-Put the settings for a machine in `.env` in the repo folder (start from `.env.example`):
-one `KEY=value` per line, comments on their own line. Every script reads it, whether run
-by hand or by the systemd timers, and git ignores it. Run `chmod 600 .env` if it holds a
-password; error messages hide the MongoDB password. A variable set in the environment
-overrides `.env`, e.g. `SBOM_DB=test python3 scan_all.py`.
+## What is stored in MongoDB
+
+Everything is in one database (`sweri_sbom` by default).
+
+- **`scans`**: one record per scan, with the full package and vulnerability list, the
+  image's ID, operating system, and the Trivy and vulnerability-database versions used.
+- **`component_state`**: one record per package per image, with its versions and when it
+  was first and last seen.
+- **`vuln_state`**: one record per vulnerability per package per image: open or resolved,
+  and when.
+- **`cve_info`**: one record per vulnerability, with its description. Kept separately so
+  large images stay within MongoDB's 16 MB limit per record. A scan that still exceeds it is
+  saved without its vulnerability list and marked `truncated`.
+- **`registry_scans`**: registry mode only. One record per image version scanned, with
+  whether it succeeded. This is how the scanner knows what it has already done.
+
+Results are kept per scanning machine, so several machines can share one database.
+
+Results saved by the September 2026 version are in an older format. The first run moves
+them aside to `vuln_state_legacy` and `component_state_legacy` (they are kept, not deleted)
+and sends each image's contents once as a new first scan.
+
+
+## All settings
+
+Settings go in `.env` in the repository folder, one `NAME=value` per line. A setting given
+on the command line takes priority, for example `SBOM_DB=test python3 scan_all.py`.
+
+- **`SBOM_MONGO_URI`**: where MongoDB is. Default `mongodb://localhost:27017`. With a
+  password: `mongodb://user:password@host:27017/?authSource=admin`, and add `&tls=true` if
+  the database uses encrypted connections. The password is hidden in error messages.
+- **`SBOM_DB`**: the database name. Default `sweri_sbom`.
+- **`SBOM_REGISTRY_USER`** and **`SBOM_REGISTRY_PASSWORD`**: a registry login, used instead
+  of the one saved by `docker login`. Only needed when Docker keeps logins somewhere the
+  scanner can't read, such as a credential helper.
+- **`SBOM_WAZUH_LOG`**: the file alerts are written to. Default
+  `/var/log/sbom/trivy-findings.jsonl`. If changed, change the agent's `<location>` to
+  match.
+- **`SBOM_WAZUH_EPS`**: alerts written per second. Default 400.
+- **`SBOM_OUT_DIR`**: where scan files and reports are written. Default the `out` folder in
+  the repository.
+- **`SBOM_TRIVY_IMAGE`**: the Trivy version to use. Default Trivy 0.74.0, fixed by its
+  digest so it can't change without review. To move to a newer version after reviewing it,
+  pull it, get its digest with
+  `docker image inspect aquasec/trivy:<version> --format '{{index .RepoDigests 0}}'`, and
+  set this to the result.
+- **`SBOM_TRIVY_CACHE`**: the Docker volume holding Trivy's vulnerability database. Default
+  `trivy-cache`.
+
+
+## When something goes wrong
+
+**"permission denied … Docker daemon socket"**
+The scanner's user isn't in the `docker` group, or hasn't logged in again since being added
+(installation step 2).
+
+**"Cannot write the Wazuh log"**
+`/var/log/sbom` is missing or owned by another user (installation step 6).
+
+**"Cannot reach MongoDB"**
+MongoDB isn't running or the address in `.env` is wrong. On the MongoDB machine, check
+`docker ps` and `docker logs mongodb`.
+
+**"rejected the scanner's login" or "token request refused"**
+The registry login is missing, wrong or expired. Run `docker login <registry>` again as the
+scanner's user.
+
+**"scan failed … context deadline exceeded"**
+The image took longer than 30 minutes to scan. Raise `--timeout` in `scan_image` in
+`scan_all.py`.
+
+**Alerts are in the log file but not in the dashboard**
+On the manager, run `sudo /var/ossec/bin/wazuh-logtest` and paste one line from
+`/var/log/sbom/trivy-findings.jsonl`. It should match a rule between 100201 and 100207. If
+it doesn't, the rules aren't installed (installation step 8). On the scanning machine, check
+the agent with `grep -i sbom /var/ossec/logs/ossec.log`.
+
+**"Agent event queue is full" alerts in Wazuh**
+Lower `SBOM_WAZUH_EPS`, or raise `<client_buffer>` in the agent's configuration.
+
+**Rule 592, "Log file size reduced"**
+Something emptied the alert file. Rotate it only with the provided logrotate configuration,
+which renames the file instead of emptying it. Never add `copytruncate` to it, and never
+clear the file with `>`.
+
+To see the latest alerts:
+```bash
+tail -n 3 /var/log/sbom/trivy-findings.jsonl | python3 -m json.tool --json-lines
+```
+
 
 ## Known limitations
 
-- **Conda.** Trivy lists Conda packages only from named environments
-  (`<conda>/envs/<name>/`), not the base environment, and never matches vulnerabilities for
-  Conda packages. ML images that install into `/opt/conda` can therefore miss their Conda
-  layer. Pip-installed packages (`.dist-info`) are covered. To check an image, run
-  `docker run --rm --entrypoint sh <image> -c 'ls /opt/conda/envs; ls /opt/conda/conda-meta | wc -l'`.
-- **Host mode scans by tag.** A tag like `:latest` can point to a different image later.
-  The image ID recorded with every scan shows when it moved. (Registry mode tracks digests.)
-- **Single architecture.** Scans run on the host's architecture (x86_64 in the lab).
-- **Scanner coverage.** Coverage and severity data are Trivy's. No second scanner (e.g.
-  Grype) cross-checks the results yet.
-- **No MongoDB authentication in the lab setup.** It relies on the localhost binding. To use
-  a remote MongoDB, set `SBOM_MONGO_URI` (with user, password and `tls=true`) in
-  `.env`. Several hosts can share one database, because all state
-  is keyed per host.
-- **Very large images are slow.** A 15GB ML image overran Trivy's default 5-minute timeout,
-  so the pipeline allows 30 minutes per image. Its baseline sends several thousand events at
-  the throttled rate.
+- **Conda packages are partly missed.** Trivy finds Conda packages only in named
+  environments (`<conda>/envs/<name>/`), not in the base environment, and never matches
+  vulnerabilities to them. Machine-learning images that install into `/opt/conda` can lose
+  that layer. Packages installed with pip are covered.
+- **Registry mode scans each image version once.** A vulnerability published afterwards is
+  only reported when that version is rebuilt. Host mode re-scans every night and catches
+  these.
+- **Host mode scans by tag.** A tag such as `latest` can point to a different image later;
+  the image ID stored with each scan shows when it moved.
+- **One processor type per run.** Images are scanned for the platform set in
+  `registries.json`, by default `linux/amd64`.
+- **One scanner.** All results come from Trivy. No second scanner checks them.
+- **Large images are slow.** A 10 GB image can take 20 minutes or more to download, and the
+  first scan sends several thousand alerts.
 
-## Troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| `permission denied ... Docker daemon socket` | Add the user to the `docker` group (setup step 1) and log in again |
-| `Cannot write the Wazuh log` | Setup step 4 |
-| `Cannot reach MongoDB` | `docker start mongodb`, then check `docker logs mongodb` |
-| `scan failed: ... context deadline exceeded` | Image too large for the 30-minute timeout; raise `--timeout` in `scan_image` |
-| Events in the log but nothing in the dashboard | On the manager, run `sudo /var/ossec/bin/wazuh-logtest` and paste a line from the event log. It should match a rule in 100201–100207. If not, check setup step 6. On the agent, check `grep -i sbom /var/ossec/logs/ossec.log` |
-| `Agent event queue is full` alerts | Lower `SBOM_WAZUH_EPS`, or raise `<client_buffer>` on the agent |
-| Rule 592 "Log file size reduced" | Something truncated the event log. Use the logrotate config, and don't `>` the file |
-
-Check the most recent events:
-`tail -n 3 /var/log/sbom/trivy-findings.jsonl | python3 -m json.tool --json-lines`
 
 ## Security notes
 
-- Trivy runs with `/var/run/docker.sock` mounted, which gives it root-equivalent control
-  of Docker. That's why the image is pinned by digest and updated only after review.
-- The pipeline user is in the `docker` group, which is also root-equivalent. Treat the
-  user accordingly.
-- MongoDB listens on 127.0.0.1 only. Keep it that way unless you add authentication.
+- Trivy runs with access to Docker, which is equivalent to root access on the scanning
+  machine. That is why the Trivy version is fixed by digest and only updated after review.
+- The scanner's user is in the `docker` group, which is also equivalent to root. Use a
+  dedicated account.
+- `.env` can contain passwords. Keep it readable by the scanner's user only
+  (`chmod 600 .env`). Git ignores it, so it is never committed.
+- Use a read-only registry account. The scanner only ever pulls.
+- The MongoDB started in installation step 5 has no password and only accepts connections
+  from the same machine. Keep it that way, or add a password before opening it to the
+  network.
 
-## Tests
 
+## Files in this repository
+
+- `scan_registry.py`: registry mode.
+- `scan_all.py`: host mode, and the scanning and change-tracking code both modes use.
+- `registries.json`: which registry and images registry mode scans.
+- `.env.example`: the template for this machine's settings.
+- `report.py`, `export_cyclonedx.py`, `gap_analysis.py`: the reports described under
+  [Running it by hand](#running-it-by-hand).
+- `sbom_common.py`: settings and helpers shared by the scripts.
+- `wazuh/sbom_rules.xml`: the alert rules for the Wazuh manager.
+- `wazuh/agent_localfile_block.xml`: the Wazuh agent setting that reads the alert file.
+- `deploy/`: the hourly and nightly schedules, and log rotation.
+- `tests/`: automated tests.
+
+**Running the tests:**
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 python3 -m pytest -q
 ```
-The tests use fixtures shaped like Trivy 0.74's CycloneDX output and an in-memory MongoDB
-(mongomock). They cover:
-
-- parsing, including fixed versions and severity selection;
-- every change-tracking case (point-release rebuild, fix, removal, regression, new DB data,
-  multiple hosts, failed delivery, legacy migration);
-- reports, the gap analysis, and schema validation of the consolidated SBOM (when
-  `cyclonedx-python-lib[json-validation]` is installed).
+They use sample Trivy output and an in-memory stand-in for MongoDB, so they need neither
+Docker nor a database.

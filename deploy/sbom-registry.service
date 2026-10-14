@@ -9,9 +9,10 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=kojo
-WorkingDirectory=/home/kojo/sbom-project
-# Settings (MongoDB address, ...) come from the .env file in the repo (README, Configuration).
+# The user and folder from README "Installing", steps 2 and 3. Change them if yours differ.
+User=sbom
+WorkingDirectory=/opt/sbom-project
+# Settings (MongoDB address, ...) come from the .env file in the repository (README, "All settings").
 ExecStart=/usr/bin/python3 scan_registry.py
 StandardOutput=append:/var/log/sbom/registry.log
 StandardError=append:/var/log/sbom/registry.log

@@ -1,1 +1,23 @@
-pymongo>=4.9,<5
+# What the pipeline needs to run
+#
+# On the scanning machine (install these yourself; pip doesn't):
+#   - Docker, with the scanner's user in the "docker" group
+#   - Python 3.10 or newer, and git
+#   - Free disk space of about twice the size of the largest image to be scanned
+#   - A Wazuh agent connected to the Wazuh manager
+#   - Network access to:
+#       the container registry (usually port 443)
+#       MongoDB (port 27017)
+#       the Wazuh manager (ports 1514 and 1515, used by the Wazuh agent)
+#       Docker Hub, to download Trivy itself
+#       mirror.gcr.io and ghcr.io, where Trivy downloads its vulnerability database
+#
+# Somewhere on the network (or on the same machine):
+#   - MongoDB (tested with 8.0)
+#   - A Wazuh manager with wazuh/sbom_rules.xml installed
+#   - The container registry, and a read-only login for it
+#
+# Python packages. Install with:  pip install -r requirements.txt
+pymongo>=4.9,<5        # used by the scanners and reports to talk to MongoDB
+pytest>=8              # only for running the tests
+mongomock>=4.1         # only for running the tests: an in-memory stand-in for MongoDB

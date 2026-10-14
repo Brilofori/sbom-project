@@ -13,5 +13,5 @@
     create
     # If logrotate reports "insecure permissions" on /var/log/sbom, uncomment this and set
     # it to the user and group that run the pipeline:
-    # su kojo kojo
+    # su sbom sbom
 }

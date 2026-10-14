@@ -9,10 +9,9 @@ After=docker.service network-online.target
 
 [Service]
 Type=oneshot
-# Change these three lines for the host. The user must be in the docker group and own
-# /var/log/sbom (see README, Setup).
-User=kojo
-WorkingDirectory=/home/kojo/sbom-project
-# Settings (MongoDB address, ...) come from the .env file in the repo (README, Configuration).
-ExecStart=/usr/bin/python3 -u /home/kojo/sbom-project/scan_all.py
+# The user and folder from README "Installing", steps 2 and 3. Change them if yours differ.
+User=sbom
+WorkingDirectory=/opt/sbom-project
+# Settings (MongoDB address, ...) come from the .env file in the repository (README, "All settings").
+ExecStart=/usr/bin/python3 -u /opt/sbom-project/scan_all.py
 TimeoutStartSec=4h
