@@ -3,33 +3,8 @@ import json
 import pytest
 
 import export_cyclonedx
-import gap_analysis
-import report
-from helpers import F127, F128, IMG, T0, run
-from sbom_common import latest_scan, latest_scans
-
-
-def test_report_after_rebuild(db, wazuh_log):
-    run(db, F127, wazuh_log, 0)
-    run(db, F128, wazuh_log, 1)
-    text = report.build_report(latest_scan(db, IMG))
-    assert "| CVE-2020-9548 | CRITICAL | jackson-databind | 2.9.10.3 | 2.9.10.4 |" in text
-    assert "**With fix available:** 3" in text
-    assert "**Resolved since last scan:** 3" in text
-    assert "CVE-2024-2398 in curl 7.88.1-10+deb12u8 (image changed)" in text
-    assert "CVE-2024-5535 in libssl3 (was 3.0.14-1~deb12u2)" in text
-
-
-def test_report_renders_scans_saved_by_the_old_version():
-    old = {"image": "pytorch/pytorch:latest", "host": "sweri-node-01", "scanned_at": T0,
-           "scanner_version": "0.74.0", "component_count": 1, "vulnerability_count": 1,
-           "new_vulnerability_count": 1,
-           "components": [{"name": "libc6", "version": "2.35", "type": "library",
-                           "purl": "pkg:deb/ubuntu/libc6@2.35"}],
-           "vulnerabilities": [{"cve_id": "CVE-1", "severity": "high", "fixed_version": None,
-                                "description": "d", "package_name": "libc6", "installed_version": "2.35",
-                                "purl": "pkg:deb/ubuntu/libc6@2.35", "is_new": True, "first_seen": T0}]}
-    assert "| CVE-1 | HIGH | libc6 | 2.35 | no fix yet |" in report.build_report(old)
+from helpers import F127, F128, run
+from sbom_common import latest_scans
 
 
 def test_latest_scans_is_per_host_and_image(db, wazuh_log):
@@ -75,19 +50,3 @@ def test_export_validates_against_the_cyclonedx_schema():
     from cyclonedx.schema import SchemaVersion
     errors = validation.JsonStrictValidator(SchemaVersion.V1_6).validate_str(json.dumps(_merged()))
     assert errors is None, errors
-
-
-def test_gap_analysis_compare(tmp_path):
-    w = tmp_path / "wazuh_inventory.txt"
-    w.write_text("apt|2.4.14\nbash|5.1-6ubuntu1.1\nsudo|1.9.9p2\n")
-    r = gap_analysis.compare(gap_analysis.load_pipe_file(w),
-                             {"apt": {"3.0.3"}, "bash": {"5.1-6ubuntu1.1"}, "base-files": {"13.8"}})
-    assert r["shared"] == ["apt", "bash"]
-    assert r["version_differs"] == [("apt", ["2.4.14"], ["3.0.3"])]
-    assert (r["wazuh_only"], r["trivy_only"]) == (["sudo"], ["base-files"])
-
-
-def test_gap_analysis_reads_trivy_side_from_a_scan(db, wazuh_log):
-    run(db, F127, wazuh_log, 0)
-    pkgs = gap_analysis.load_from_scan(latest_scan(db, IMG))
-    assert pkgs["libc6"] == {"2.36-9+deb12u7"} and "debian" not in pkgs

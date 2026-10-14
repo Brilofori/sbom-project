@@ -95,12 +95,3 @@ def latest_scans(db, host=None, image=None):
     ]
     ids = [d["scan_id"] for d in db["scans"].aggregate(pipeline, allowDiskUse=True)]
     return list(db["scans"].find({"_id": {"$in": ids}}).sort([("image", 1), ("host", 1)]))
-
-
-def latest_scan(db, image, host=None, skip=0):
-    """The most recent scan of one image (skip=1 gives the one before it)."""
-    query = {"image": image}
-    if host:
-        query["host"] = host
-    docs = list(db["scans"].find(query).sort("scanned_at", -1).skip(skip).limit(1))
-    return docs[0] if docs else None

@@ -241,24 +241,16 @@ stops straight away. If any image fails, the others still run and the command en
 error, so the scheduler records the failure. In registry mode a failed image is tried again
 on the next run, up to three times.
 
-**Reports.** These read what is already stored in MongoDB:
+**The combined SBOM.** One CycloneDX file listing every package and vulnerability in every
+scanned image, built from what is already stored in MongoDB. This is the file to give an
+auditor or another security tool:
 ```bash
-python3 report.py python:3.11-slim       # vulnerability summary for one image (Markdown)
-python3 export_cyclonedx.py              # one CycloneDX SBOM file covering every image
-python3 gap_analysis.py wazuh_inventory.txt --image python:3.11-slim
+python3 export_cyclonedx.py              # writes out/sweri-consolidated.cdx.json
 ```
-`gap_analysis.py` compares the packages Wazuh sees on the machine itself with the packages
-inside an image, to show what each one misses. Its input comes from the Wazuh manager:
-```bash
-sudo sqlite3 /var/ossec/queue/db/001.db "SELECT name, version FROM sys_programs;" > wazuh_inventory.txt
-```
-where `001` is the scanning machine's Wazuh agent ID.
 
 **Where the files go.** Everything is written to the `out` folder in the repository: the
-latest SBOM of each image (`out/<image>.json`, and `out/registry/` for registry mode), a
-vulnerability report for each image (`out/report_<image>.md`), and the combined SBOM from
-`export_cyclonedx.py` (`out/sweri-consolidated.cdx.json`). A failed scan keeps the previous
-good file.
+latest SBOM of each image (`out/<image>.json`, and `out/registry/` for registry mode) and the
+combined SBOM. A failed scan keeps the previous good file.
 
 
 ## What Wazuh receives
@@ -352,7 +344,7 @@ on the command line takes priority, for example `SBOM_DB=test python3 scan_all.p
   `/var/log/sbom/trivy-findings.jsonl`. If changed, change the agent's `<location>` to
   match.
 - **`SBOM_WAZUH_EPS`**: alerts written per second. Default 400.
-- **`SBOM_OUT_DIR`**: where scan files and reports are written. Default the `out` folder in
+- **`SBOM_OUT_DIR`**: where scan files and the combined SBOM are written. Default the `out` folder in
   the repository.
 - **`SBOM_TRIVY_IMAGE`**: the Trivy version to use. Default Trivy 0.74.0, fixed by its
   digest so it can't change without review. To move to a newer version after reviewing it,
@@ -442,7 +434,7 @@ tail -n 3 /var/log/sbom/trivy-findings.jsonl | python3 -m json.tool --json-lines
 - `scan_all.py`: host mode, and the scanning and change-tracking code both modes use.
 - `registries.json`: which registry and images registry mode scans.
 - `.env.example`: the template for this machine's settings.
-- `report.py`, `export_cyclonedx.py`, `gap_analysis.py`: the reports described under
+- `export_cyclonedx.py`: the combined SBOM described under
   [Running it by hand](#running-it-by-hand).
 - `sbom_common.py`: settings and helpers shared by the scripts.
 - `wazuh/sbom_rules.xml`: the alert rules for the Wazuh manager.

@@ -18,6 +18,6 @@
 #   - The container registry, and a read-only login for it
 #
 # Python packages. Install with:  pip install -r requirements.txt
-pymongo>=4.9,<5        # used by the scanners and reports to talk to MongoDB
+pymongo>=4.9,<5        # used by the scanners and the SBOM export to talk to MongoDB
 pytest>=8              # only for running the tests
 mongomock>=4.1         # only for running the tests: an in-memory stand-in for MongoDB

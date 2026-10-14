@@ -8,7 +8,7 @@ Usage:
     python3 scan_all.py --rebaseline     forget previous state and resend everything once
 
 Per image: Trivy -> CycloneDX JSON (out/) -> compare with state in MongoDB -> append
-changes to the Wazuh log -> commit state -> save the scan -> write out/report_<image>.md.
+changes to the Wazuh log -> commit state -> save the scan.
 Events are written *before* state is committed, so a failed write is retried next run
 instead of being lost.
 """
@@ -25,7 +25,6 @@ from datetime import datetime, timezone
 from pymongo import UpdateOne
 from pymongo.errors import DocumentTooLarge
 
-import report
 from sbom_common import OUT_DIR, PACKAGE_TYPES, get_db, identity, safe_name
 
 HOSTNAME = socket.gethostname()
@@ -397,7 +396,7 @@ def ingest(db, image, sbom_path, host=None, scanner_version=None, db_updated=Non
     if vuln_ops:
         db["vuln_state"].bulk_write(vuln_ops, ordered=False)
 
-    doc = {                                  # 3. then keep the scan for reports
+    doc = {                                  # 3. then keep the scan (used by the SBOM export)
         "host": host,
         "image": image,
         "scanned_at": now,
@@ -608,10 +607,6 @@ def main(argv=None):
             print(f"     failed: {type(e).__name__}: {e}")
             results.append({"image": image, "error": type(e).__name__})
             continue
-        try:
-            report.write_report(db, image, OUT_DIR / f"report_{safe_name(image)}.md", host=HOSTNAME)
-        except Exception as e:
-            print(f"     report not written: {type(e).__name__}: {e}")
         results.append(r)
         print(f"     {r['packages']} packages ({r['added']} new, {r['changed']} changed, "
               f"{r['removed']} removed)  |  {r['vulnerabilities']} vulns ({r['new_vulns']} new, "

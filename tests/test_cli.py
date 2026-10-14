@@ -120,7 +120,6 @@ def test_main_end_to_end(monkeypatch, tmp_path, db, capsys):
     assert "FATAL unable to find the specified image" in out
     assert "(1 ok, 1 failed)" in out
     assert (tmp_path / "out" / "example_app_1.0.json").exists()
-    assert (tmp_path / "out" / "report_example_app_1.0.md").exists()
     assert len(read_events(str(log))) == BASELINE_EVENTS
 
     assert scan_all.main([]) == 1                                  # second run: nothing new to send
