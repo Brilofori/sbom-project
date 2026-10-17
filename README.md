@@ -22,9 +22,9 @@ reach each other over the network.
 
 - **Container registry.** Where the images are stored, such as Harbor, Azure Container
   Registry, GitLab or Docker Hub.
-- **Scanning machine.** Runs this code. For each image it pulls the image, has
-  [Trivy](https://trivy.dev) list every package and vulnerability in it, then deletes the
-  image again.
+- **Scanning machine.** Runs this code. For each image it downloads the image, unless the
+  machine already has it, has [Trivy](https://trivy.dev) list every package and
+  vulnerability in it, then deletes what it downloaded.
 - **MongoDB.** Keeps every scan and remembers what each image contained last time.
 - **Wazuh manager.** Receives an alert for each change, through the Wazuh agent on the
   scanning machine.
@@ -34,16 +34,34 @@ After that, Wazuh hears about an image only when something changes: a package is
 removed or upgraded, the image is rebuilt, or a new vulnerability is published that affects
 it. A scan that finds nothing new sends nothing.
 
-### Two ways to run it
+### Three ways to run it
 
-- **Registry mode** (`scan_registry.py`) scans images straight from a registry. It pulls one
+- **Registry mode** (`scan_registry.py`) scans the images in a registry. It downloads one
   image at a time, scans it and deletes it, so the scanning machine never stores more than
-  one image. Images that were already on the machine are never deleted. An image is scanned once, and again only when it is rebuilt. Runs hourly.
-- **Host mode** (`scan_all.py`) scans the images already on the scanning machine. It
-  re-scans all of them each time, which is how it notices newly published vulnerabilities
-  in images that haven't changed. Runs nightly.
+  one downloaded image. An image the machine already has is scanned where it is, and never
+  deleted. Images are downloaded by their digest (the registry's fingerprint for that exact
+  image), so a tag on the machine never changes. Each image is scanned once, and again only
+  when it is rebuilt. Runs hourly.
+- **Host mode** (`scan_all.py`) scans the images already on the scanning machine, and never
+  downloads anything. It re-scans all of them each time, which is how it notices newly
+  published vulnerabilities in images that haven't changed. Runs nightly.
+- **Both at once** (`scan_registry.py --local`) is for a machine that has images of its own
+  and should also cover a registry, such as a build server that pushes to it. Each run
+  first scans every image on the machine, as host mode does, then scans from the registry
+  only the images the machine doesn't have.
 
-Both produce the same results and alerts, and can run on the same machine.
+All three produce the same results and alerts. Run one of them per machine: where a machine
+has its own images and also needs a registry covered, use `--local` rather than both
+scanners, so that each image is reported from one place.
+
+**Each image is scanned once, under one name.** An image often has several tags, such as
+`1.4.2` and `latest`, or a short local name as well as its name in the registry. It is
+scanned once and reported under one of them; the others are listed in each alert, under
+`other_tags`. The name chosen is a fixed version rather than `latest`, since `latest` moves
+to the next build, and a name with the registry's address rather than one without. An
+image keeps the name it was reported under for as long as it has that tag. If that tag
+moves on to a newer build or is removed, the image carries on under one of its other tags
+and takes its record with it, so nothing about it is sent again.
 
 
 ## Setting it up on a new site
@@ -158,7 +176,8 @@ python3 scan_registry.py --dry-run
 python3 scan_registry.py
 ```
 The dry run lists every image that would be scanned, without downloading anything. A wrong
-address, login or certificate shows up here. The second command scans for real.
+address, login or certificate shows up here. The second command scans for real. On a machine
+with images of its own, add `--local` to both commands.
 
 **Step 10. Schedule it.**
 In `deploy/sbom-registry.service`, check the `User=` and `WorkingDirectory=` lines match
@@ -169,9 +188,10 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now sbom-registry.timer
 sudo cp deploy/logrotate-sbom /etc/logrotate.d/sbom
 ```
-The scanner now runs five minutes after the machine starts, then every hour. For host mode,
-use `sbom-scan.service` and `sbom-scan.timer` in the same way; that runs nightly at about
-02:30.
+The scanner now runs five minutes after the machine starts, then every hour. On a machine
+that also has images of its own, such as a build server, add `--local` to the end of the
+`ExecStart=` line first. For host mode, use `sbom-scan.service` and `sbom-scan.timer` in the
+same way; that runs nightly at about 02:30.
 
 
 ## Choosing what to scan
@@ -254,6 +274,8 @@ Registry mode:
 ```bash
 python3 scan_registry.py --dry-run       # show what would be scanned
 python3 scan_registry.py                 # scan once
+python3 scan_registry.py --local         # this machine's images first, then the registry
+python3 scan_registry.py --retry-failed  # also retry images it gave up on (see "giving up on")
 ```
 
 Host mode:
@@ -262,11 +284,13 @@ python3 scan_all.py                      # every image on this machine
 python3 scan_all.py images.txt           # only the images listed in the file, one per line
 python3 scan_all.py --rebaseline         # forget previous results and resend everything once
 ```
+Images listed in a file must be on the machine already; host mode never downloads them. A
+name is reported the way Docker lists it, so `nginx` is reported as `nginx:latest`.
 
 Only one scan runs at a time. If a scan is already running, in either mode, a second one
 stops straight away. If any image fails, the others still run and the command ends with an
 error, so the scheduler records the failure. In registry mode a failed image is tried again
-on the next run, up to three times.
+on the next run, up to three times in all.
 
 **The combined SBOM.** One CycloneDX file listing every package and vulnerability in every
 scanned image, built from what is already stored in MongoDB. This is the file to give an
@@ -306,16 +330,20 @@ Each vulnerability alert also says why it is new, in the `cause` field:
 - **`regression`**: this vulnerability was fixed before and has come back.
 
 Registry-mode alerts also carry `scanner_mode: "registry"`, the `registry` and the image's
-`digest`.
+`digest`. Alerts for an image with several tags carry `other_tags`: the tags it was not
+reported under.
 
 **Every run also sends one summary,** so you can tell from the dashboard that the scanner is
 working, and see straight away when it isn't:
 
 - **`scan_run`** (rule 100208, level 3): the run finished. It says how many images were
-  scanned (`scanned`) and how many failed (`failed`).
+  scanned (`scanned`), how many failed (`failed`), and how the scanner was run
+  (`scanner_mode`: `host`, `registry`, or `local+registry` for `--local`). In registry mode
+  it also counts the tags it left alone (`skipped`) and the images it gave up on
+  (`abandoned`); both are explained under [When something goes wrong](#when-something-goes-wrong).
 - The same summary rises to **level 7** (rule 100209) when something went wrong but the run
-  carried on: some images failed to scan, or one image's versions couldn't be listed.
-  `errors` says what and why.
+  carried on: some images failed to scan, one image's versions couldn't be listed, or a
+  downloaded image couldn't be removed afterwards. `errors` says what and why.
 - It rises to **level 10** (rule 100210) when the run couldn't do its job at all: MongoDB
   was unreachable, the registry couldn't be read (usually an expired login), every image
   failed, or the scanner stopped on an unexpected error.
@@ -355,7 +383,9 @@ produce several thousand alerts, which then take a few seconds to send.
 Everything is in one database (`sweri_sbom` by default).
 
 - **`scans`**: one record per scan, with the full package and vulnerability list, the
-  image's ID, operating system, and the Trivy and vulnerability-database versions used.
+  image's ID, operating system, and the Trivy and vulnerability-database versions used. A
+  short record marked `carried_from` isn't a scan: it notes that an image's record moved to
+  a new name.
 - **`component_state`**: one record per package per image, with its versions and when it
   was first and last seen.
 - **`vuln_state`**: one record per vulnerability per package per image: open or resolved,
@@ -364,7 +394,13 @@ Everything is in one database (`sweri_sbom` by default).
   large images stay within MongoDB's 16 MB limit per record. A scan that still exceeds it is
   saved without its vulnerability list and marked `truncated`.
 - **`registry_scans`**: registry mode only. One record per image version scanned, with
-  whether it succeeded. This is how the scanner knows what it has already done.
+  whether it succeeded. This is how the scanner knows what it has already done. A tag that
+  is the same image as one already scanned is recorded with `same_as`, the name the image
+  was reported under.
+
+`component_state` and `vuln_state` are kept under the name each image is reported under.
+When an image's name changes, its records move with it; a name that becomes one of another
+image's other tags loses its own records.
 
 Results are kept per scanning machine, so several machines can share one database.
 
@@ -398,6 +434,8 @@ on the command line takes priority, for example `SBOM_DB=test python3 scan_all.p
   set this to the result.
 - **`SBOM_TRIVY_CACHE`**: the Docker volume holding Trivy's vulnerability database. Default
   `trivy-cache`.
+- **`SBOM_SCAN_TIMEOUT`**: the longest one image's scan may take, as a number and a unit,
+  for example `30m`, `90m` or `2h`. Default `30m`.
 - **`SBOM_MIN_FREE_GB`**: disk space registry mode always leaves free on Docker's disk, in
   GB. Default 10. Before each download it checks there is room for about five times the
   image's download size on top of this, and skips the image if not. When the registry
@@ -407,9 +445,10 @@ on the command line takes priority, for example `SBOM_DB=test python3 scan_all.p
 ## When something goes wrong
 
 Problems during a run show up in Wazuh as rule 100209 (some images failed) or 100210 (the
-run couldn't scan at all), with the reason in `data.errors`. The scanner's own log has the
-detail: `/var/log/sbom/registry.log` for registry mode, or `journalctl -u sbom-scan.service`
-for host mode.
+run couldn't scan at all), with the reason in `data.errors`. Images registry mode gave up on
+in earlier runs are counted in every summary's `data.abandoned`. The scanner's own log has
+the detail: `/var/log/sbom/registry.log` for registry mode, or
+`journalctl -u sbom-scan.service` for host mode.
 
 **"not enough disk space"**
 Docker's disk doesn't have room for the image. Free some space (for example
@@ -432,8 +471,39 @@ The registry login is missing, wrong or expired. Run `docker login <registry>` a
 scanner's user.
 
 **"scan failed … context deadline exceeded"**
-The image took longer than 30 minutes to scan. Raise `--timeout` in `scan_image` in
-`scan_all.py`.
+The image took longer to scan than `SBOM_SCAN_TIMEOUT` allows (30 minutes unless changed).
+Raise it in `.env`, for example `SBOM_SCAN_TIMEOUT=2h`. For host mode, also check that the
+whole nightly run still fits in the time `deploy/sbom-scan.service` allows it
+(`TimeoutStartSec=4h`); raise that too if not.
+
+**"couldn't ask Docker about …"**
+Docker didn't answer in time, often because it is busy, for example during a large build.
+Nothing is downloaded or removed for that image, and it is tried again on the next run.
+
+**"left … on this machine"** (rule 100209)
+A downloaded image was scanned, but couldn't be removed afterwards: Docker didn't answer,
+or refused because something is using the image. The message, also in the run summary's
+`errors`, gives the command that removes it.
+
+**"giving up on …"** (counted as `abandoned` in the run summary)
+The image failed three runs in a row, so registry mode no longer tries it. The run where it
+failed the third time raised rule 100209 and said why; after that, every run summary
+counts it under `abandoned`. If the scan ran out of time, raising `SBOM_SCAN_TIMEOUT` gives
+it three new tries automatically. After fixing anything else, such as a login, run
+`python3 scan_registry.py --retry-failed` once. (After updating from an earlier version of
+the scanner, images it had given up on get three new tries.)
+
+**"not among this machine's images"**
+Host mode was given an image, in an inventory file, that isn't on the machine. It only
+scans images that are already there. Pull the image first, or scan it from its registry
+with registry mode.
+
+**"skipped, this machine has a different image under this name"** (with `--local`)
+The machine has an image under a tag the registry also has, and Docker can't show it is the
+registry's image: usually a build that hasn't been pushed yet, or an old download. The
+machine's image is scanned (and reported under one of its names), and the registry's
+version of that tag is skipped until the two match again, after a push or a pull. The run
+summary counts these tags as `skipped`. This is a note, not a failure.
 
 **Alerts are in the log file but not in the dashboard**
 On the manager, run `sudo /var/ossec/bin/wazuh-logtest` and paste one line from
@@ -463,9 +533,13 @@ tail -n 3 /var/log/sbom/trivy-findings.jsonl | python3 -m json.tool --json-lines
   that layer. Packages installed with pip are covered.
 - **Registry mode scans each image version once.** A vulnerability published afterwards is
   only reported when that version is rebuilt. Host mode re-scans every night and catches
-  these.
-- **Host mode scans by tag.** A tag such as `latest` can point to a different image later;
-  the image ID stored with each scan shows when it moved.
+  these, as does `--local` for the images on the machine.
+- **Each version is reported separately.** A new version of an image is reported under its
+  own name, such as `app:1.5.0`, so its first scan sends its full contents rather than only
+  what changed since `app:1.4.2`.
+- **With `--local`, a tag that differs** between the machine and the registry is scanned
+  from the machine only, until the two match again. The run summary counts these as
+  `skipped`.
 - **One processor type per run.** Images are scanned for the platform set in
   `registries.json`, by default `linux/amd64`.
 - **One scanner.** All results come from Trivy. No second scanner checks them.

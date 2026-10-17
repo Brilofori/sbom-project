@@ -20,6 +20,16 @@ def _bulk_write(self, requests, ordered=True, **kwargs):
 mongomock.collection.Collection.bulk_write = _bulk_write
 
 
+@pytest.fixture(autouse=True)
+def _never_the_real_wazuh_log(monkeypatch, tmp_path):
+    """Every run sends Wazuh a summary, even one that stops early. Point all tests at a
+    scratch file so running them on a scanning machine never sends real alerts."""
+    import scan_all
+    import scan_registry
+    monkeypatch.setattr(scan_all, "WAZUH_JSONL", str(tmp_path / "unused-wazuh-log.jsonl"))
+    monkeypatch.setattr(scan_registry, "REMOVE_WAIT", 0)         # no pauses between retries
+
+
 @pytest.fixture
 def db():
     return mongomock.MongoClient()["sweri_sbom_test"]

@@ -13,6 +13,7 @@ Type=oneshot
 User=sbom
 WorkingDirectory=/opt/sbom-project
 # Settings (MongoDB address, ...) come from the .env file in the repository (README, "All settings").
+# On a machine that also has images of its own (a build server), add --local to the end of this line.
 ExecStart=/usr/bin/python3 scan_registry.py
 StandardOutput=append:/var/log/sbom/registry.log
 StandardError=append:/var/log/sbom/registry.log

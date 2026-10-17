@@ -7,15 +7,20 @@ Each pass it:
 
   1. lists the tags in every repository in the registry (or only those named in
      registries.json)
-  2. skips any image (tag + digest) that has already been scanned
-  3. pulls one image, then scans it and ships the changes to Wazuh exactly as
-     scan_all.py does (same Trivy, parsing, change tracking and events), then
-     removes the image from disk
-  4. moves on to the next image
+  2. skips any image (tag + digest) that has already been scanned, and scans tags that
+     share a digest only once
+  3. scans each remaining image and ships the changes to Wazuh exactly as scan_all.py
+     does (same Trivy, parsing, change tracking and events): an identical copy already
+     on this machine is scanned in place; otherwise the image is downloaded by its
+     digest (never by tag, so tags on this machine are never changed), scanned, and
+     removed again
 
 Each image is scanned once. If a tag is later rebuilt (its digest changes) it is
-scanned again, and the Wazuh events show what changed. Only one image is on disk
-at a time, which is what makes this workable for 10-30GB images.
+scanned again, and the Wazuh events show what changed. Only one downloaded image is on
+disk at a time, which is what makes this workable for 10-30GB images.
+
+With --local it first scans every image already on this machine, as scan_all.py does,
+then downloads from the registry only what isn't here: the setup for a build server.
 
 Registries: Docker Hub (via its own API) and any registry that speaks the Docker
 Registry v2 API - Harbor, GitLab, Nexus, Artifactory, plain registry:2. Private
@@ -24,6 +29,7 @@ SBOM_REGISTRY_USER / SBOM_REGISTRY_PASSWORD.
 
 Usage:
   python3 scan_registry.py              # one pass (use with the hourly timer)
+  python3 scan_registry.py --local      # this machine's images first, then the registry
   python3 scan_registry.py --dry-run    # list what would be scanned, pull nothing
   python3 scan_registry.py --config other.json
 """
@@ -42,6 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from typing import NamedTuple
 
 import scan_all
 from sbom_common import OUT_DIR, get_db
@@ -49,6 +56,7 @@ from sbom_common import OUT_DIR, get_db
 REG_OUT = OUT_DIR / "registry"   # latest CycloneDX file per registry image
 MAX_ATTEMPTS = 3                 # give up on an image after this many failed passes
 PULL_TIMEOUT = 3600              # seconds
+REMOVE_TRIES, REMOVE_WAIT = 3, 20  # chances Docker gets to answer before a download is left in place
 # Disk space to leave free on Docker's disk after a pull, in GB. While it is scanned an image
 # needs about five times its download size: Docker keeps it unpacked (2-3x the compressed
 # download) and Trivy writes a second, uncompressed copy to scan.
@@ -171,6 +179,7 @@ class V2Registry:
         self.base = f"{'http' if insecure else 'https'}://{host}"
         self.creds = registry_creds(host)
         self.auth = {}                      # scope -> Authorization header value
+        self.manifests = {}                 # (repo, ref, platform) -> manifest, see manifest()
 
     def basic(self):
         return "Basic " + base64.b64encode(":".join(self.creds).encode()).decode()
@@ -223,26 +232,42 @@ class V2Registry:
             pages += 1
         return names
 
+    def manifest(self, repo, ref, platform):
+        """The image manifest of repo@ref for this platform (the one for our platform, if ref
+        is a multi-platform index), or None if there is no image for it. Kept, since size()
+        and config_digest() both need it."""
+        key = (repo, ref, platform)
+        if key not in self.manifests:
+            scope = f"repository:{repo}:pull"
+            with self.get(f"/v2/{repo}/manifests/{ref}", scope, MANIFEST_TYPES) as r:
+                doc = json.load(r)
+            if doc.get("manifests"):                  # multi-platform: find ours
+                os_name, arch = platform.split("/")[:2]
+                mine = [m for m in doc["manifests"]
+                        if (m.get("platform") or {}).get("os") == os_name
+                        and (m.get("platform") or {}).get("architecture") == arch]
+                doc = None
+                if mine:
+                    with self.get(f"/v2/{repo}/manifests/{mine[0]['digest']}", scope, MANIFEST_TYPES) as r:
+                        doc = json.load(r)
+            self.manifests[key] = doc
+        return self.manifests[key]
+
     def size(self, repo, ref, platform):
         """Download size in bytes of repo@ref for this platform (layers + config), from the
         manifest. None if the registry doesn't say."""
-        scope = f"repository:{repo}:pull"
-        with self.get(f"/v2/{repo}/manifests/{ref}", scope, MANIFEST_TYPES) as r:
-            doc = json.load(r)
-        if doc.get("manifests"):                      # multi-platform: find ours
-            os_name, arch = platform.split("/")[:2]
-            mine = [m for m in doc["manifests"]
-                    if (m.get("platform") or {}).get("os") == os_name
-                    and (m.get("platform") or {}).get("architecture") == arch]
-            if not mine:
-                return None
-            with self.get(f"/v2/{repo}/manifests/{mine[0]['digest']}", scope, MANIFEST_TYPES) as r:
-                doc = json.load(r)
+        doc = self.manifest(repo, ref, platform) or {}
         layers = doc.get("layers")
         if not layers:
             return None
         sizes = [layer.get("size") for layer in layers] + [(doc.get("config") or {}).get("size", 0)]
         return sum(sizes) if all(isinstance(s, int) for s in sizes) else None
+
+    def config_digest(self, repo, ref, platform):
+        """The digest of the image's configuration, which Docker's classic image store uses as
+        the image ID: how an image on this machine is recognised when Docker has no record of
+        the registry digest it came from. None if the registry doesn't say."""
+        return ((self.manifest(repo, ref, platform) or {}).get("config") or {}).get("digest")
 
     def catalog(self):
         """Every repository in the registry. The login needs permission to list them."""
@@ -292,25 +317,24 @@ def run(cmd, timeout):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
-def image_present(ref):
-    return run(["docker", "image", "inspect", ref], 60).returncode == 0
+def split_ref(ref):
+    """("host/repo", "tag") for "host/repo:tag"; a ':' that belongs to a registry port isn't
+    a tag. The tag is None if there isn't one."""
+    name, sep, tag = ref.rpartition(":")
+    if sep and "/" not in tag:
+        return name, tag
+    return ref, None
+
+
+def digest_ref(image, digest):
+    """The reference for exactly this digest of the image's repository: repo@sha256:..."""
+    return f"{split_ref(image)[0]}@{digest}"
 
 
 def pull(ref, platform):
     r = run(["docker", "pull", "--platform", platform, ref], PULL_TIMEOUT)
     if r.returncode != 0:
         raise RuntimeError(f"pull failed: {r.stderr.strip()[-500:]}")
-
-
-def local_digest(ref):
-    r = run(["docker", "image", "inspect", ref, "--format",
-             "{{range .RepoDigests}}{{println .}}{{end}}"], 60)
-    name = ref.rsplit(":", 1)[0] if ":" in ref.rsplit("/", 1)[-1] else ref
-    lines = [line.strip() for line in r.stdout.splitlines() if "@" in line]
-    for line in lines:                      # the digest recorded for this repo, if there are several
-        if line.split("@", 1)[0] == name:
-            return line.split("@", 1)[1]
-    return lines[0].split("@", 1)[1] if lines else None
 
 
 def docker_root():
@@ -341,22 +365,61 @@ def space_problem(size, root):
 
 
 def remove(ref):
-    r = run(["docker", "rmi", ref], 300)
-    if r.returncode != 0:
-        log(f"  warning: could not remove {ref}: {r.stderr.strip()[-200:]}")
+    """Remove an image this pass downloaded, if it is here. Returns None, or a note saying it
+    was left on this machine. Removing is the one step that can't be undone, so it is only
+    done once Docker confirms the image is there; Docker gets a few chances to answer."""
+    problem = None
+    for n in range(REMOVE_TRIES):
+        if n:
+            time.sleep(REMOVE_WAIT)
+        try:
+            if scan_all.image_id(ref) is None:
+                return None
+            log(f"  removing {ref}")
+            r = run(["docker", "rmi", ref], 300)
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            problem = f"Docker didn't answer ({e})"
+            continue
+        if r.returncode == 0:
+            return None
+        problem = r.stderr.strip()[-200:] or f"docker rmi exited {r.returncode}"
+        break                           # Docker answered: asking again won't change its mind
+    note = f"left {ref} on this machine: {problem}. Remove it with: docker rmi {ref}"
+    log(f"  warning: {note}")
+    return note
 
 
 # ---------------------------------------------------------------- one image
 
-def process(db, item, trivy, platform, size=None, root=None):
-    """Check space, pull, scan + ship (scan_all's code), record, remove. Returns a summary."""
+def mark_done(done, item, same_as, now):
+    """Record a tag as scanned because the identical image was scanned as `same_as`."""
     image, repo, tag, digest, registry = item
-    version, db_updated, db_ready = trivy
-    done = db["registry_scans"]
-    had_it = image_present(image)       # never delete an image someone else put here
-    started = time.time()
+    done.update_one({"image": image, "digest": digest},
+                    {"$set": {"repo": repo, "tag": tag, "registry": registry, "status": "ok",
+                              "scanned_at": now, "same_as": same_as},
+                     "$unset": {"error": ""}},
+                    upsert=True)
 
-    short = None if had_it else space_problem(size, root)
+
+def process(db, item, trivy, platform, size=None, root=None, others=(), seen=None):
+    """Scan one registry image and ship the changes (scan_all's code), then record it.
+
+    The image is read by its digest (repo@sha256:...), never by its tag, so what is scanned
+    is exactly the registry's image, whatever the tags on this machine point to, and no tag
+    here is ever changed. If this machine already has the image it is scanned where it is
+    and left alone; otherwise it is downloaded, scanned and removed again. `others` are the
+    registry's other tags for the same image: they are recorded as scanned too, and named in
+    the events' other_tags. `seen` (--local) maps the IDs of the images this run scanned on
+    this machine to the names they were reported under: if the image turns out to be one of
+    them, it is recorded as the same image, not scanned and reported a second time."""
+    image, repo, tag, digest, registry = item
+    done = db["registry_scans"]
+    by_digest = digest_ref(image, digest)
+    try:
+        had_it = scan_all.image_id(by_digest) is not None   # never delete what was already here
+        short = None if had_it else space_problem(size, root)
+    except RuntimeError as e:          # Docker didn't answer: leave this image alone until next pass
+        had_it, short = True, str(e)
     if short:                           # not the image's fault: try again next pass, no attempt used
         log(f"  skipped: {short}")
         done.update_one({"image": image, "digest": digest},
@@ -368,48 +431,86 @@ def process(db, item, trivy, platform, size=None, root=None):
         return {"image": image, "status": "failed", "error": short}
 
     try:
-        log(f"  pulling {image}")
-        pull(image, platform)
-        actual = local_digest(image) or digest
-        if actual != digest:
-            log(f"  note: tag moved while listing ({digest[:19]} -> {actual[:19]})")
-            digest = actual
-            if done.find_one({"image": image, "digest": digest, "status": "ok"}):
-                log("  already scanned at this digest, skipping")
-                return {"image": image, "status": "skipped"}
+        result = scan_one(db, item, trivy, platform, by_digest, had_it, others, seen)
+    finally:
+        left = None if had_it else remove(by_digest)
+    if left:
+        result["warning"] = left
+    return result
+
+
+def scan_one(db, item, trivy, platform, by_digest, had_it, others, seen):
+    """The middle of process(): download unless here, then scan, ship and record. Returns the
+    result. A failure is recorded, and after MAX_ATTEMPTS of them with the same
+    SBOM_SCAN_TIMEOUT the image isn't tried again (one_pass)."""
+    image, repo, tag, digest, registry = item
+    version, db_updated, db_ready = trivy
+    done = db["registry_scans"]
+    started = time.time()
+    try:
+        if had_it:
+            log("  already on this machine: scanning it there, nothing to download")
+        else:
+            log(f"  downloading {by_digest}")
+            pull(by_digest, platform)
+        same_as = recognise(by_digest, seen)
+        if same_as:
+            log(f"  the same image as {same_as}, scanned on this machine above")
+            now = datetime.now(timezone.utc)
+            for one in (item, *others):
+                mark_done(done, one, same_as, now)
+            return {"image": image, "status": "same"}
 
         log("  scanning")
-        sbom_path = scan_all.scan_image(image, REG_OUT, skip_db_update=db_ready)
+        sbom_path = scan_all.scan_image(image, REG_OUT, skip_db_update=db_ready, target=by_digest)
+        extra = {"scanner_mode": "registry", "registry": registry, "digest": digest}
+        if others:
+            extra["other_tags"] = ", ".join(other[0] for other in others)
         r = scan_all.ingest(db, image, sbom_path, scanner_version=version, db_updated=db_updated,
-                            extra={"scanner_mode": "registry", "registry": registry, "digest": digest})
+                            extra=extra)
+        scan_all.forget(db, scan_all.HOSTNAME, [other[0] for other in others])
         seconds = round(time.time() - started)
+        now = datetime.now(timezone.utc)
         done.update_one({"image": image, "digest": digest},
                         {"$set": {"repo": repo, "tag": tag, "registry": registry,
-                                  "status": "ok", "scanned_at": datetime.now(timezone.utc),
+                                  "status": "ok", "scanned_at": now,
                                   "packages": r["packages"], "vulnerabilities": r["vulnerabilities"],
                                   "events": r["sent"], "seconds": seconds},
                          "$unset": {"error": ""}},
                         upsert=True)
+        for other in others:
+            mark_done(done, other, image, now)
         log(f"  ok: {r['packages']} packages, {r['vulnerabilities']} vulns, "
             f"{r['sent']} events to Wazuh, {seconds}s")
         return {"image": image, "status": "ok"}
 
     except Exception as e:
         err = str(e)[-800:]
+        prev = done.find_one({"image": image, "digest": digest}) or {}
+        # A new SBOM_SCAN_TIMEOUT starts the count again: it may be what makes the scan work
+        tries = 1 + (prev.get("attempts", 0) if prev.get("timeout") == scan_all.SCAN_TIMEOUT else 0)
         done.update_one({"image": image, "digest": digest},
                         {"$set": {"repo": repo, "tag": tag, "registry": registry,
-                                  "status": "failed", "error": err,
-                                  "last_attempt": datetime.now(timezone.utc)},
-                         "$inc": {"attempts": 1}},
+                                  "status": "failed", "error": err, "attempts": tries,
+                                  "timeout": scan_all.SCAN_TIMEOUT,
+                                  "last_attempt": datetime.now(timezone.utc)}},
                         upsert=True)
         log(f"  FAILED: {err}")
-        return {"image": image, "status": "failed", "error": err.strip().splitlines()[-1][-300:]
-                if err.strip() else "unknown error"}
+        reason = err.strip().splitlines()[-1][-300:] if err.strip() else "unknown error"
+        if tries >= MAX_ATTEMPTS:
+            reason += f" (gave up after {tries} tries)"
+        return {"image": image, "status": "failed", "error": reason}
 
-    finally:
-        if not had_it and image_present(image):
-            log(f"  removing {image}")
-            remove(image)
+
+def recognise(ref, seen):
+    """If `ref` is an image this run already scanned on this machine (--local), the name it
+    was reported under; else None."""
+    if not seen:
+        return None
+    try:
+        return seen.get(scan_all.image_id(ref))
+    except RuntimeError:
+        return None
 
 
 # ---------------------------------------------------------------- one pass
@@ -432,7 +533,22 @@ def repositories(cfg, clients):
     return [{"repo": n, **shared} for n in sorted(names)]
 
 
-def one_pass(cfg, db, dry_run=False):
+class OnThisMachine(NamedTuple):
+    """What --local found on this machine, for the registry pass that follows it. An image
+    is known by its image ID and by every registry digest (repo@sha256:...) Docker has
+    recorded for it."""
+    names: frozenset    # every image name (repo:tag) here
+    scanned: dict       # ID or digest of each image scanned here -> the name it was reported under
+    failed: frozenset   # IDs and digests of the images here whose scan failed
+
+
+NOTHING_HERE = OnThisMachine(frozenset(), {}, frozenset())
+
+
+def one_pass(cfg, db, dry_run=False, trivy=None, here=NOTHING_HERE, retry=False):
+    """One registry pass. With --local, `here` is what this run already found and scanned on
+    this machine, so none of it is scanned again. `retry` (--retry-failed): images given up
+    on are tried again."""
     registry = cfg.get("registry", "docker.io")
     platform = cfg.get("platform", "linux/amd64")
     done = db["registry_scans"]
@@ -440,6 +556,7 @@ def one_pass(cfg, db, dry_run=False):
     clients = {}
     todo = []
     unlisted = []                       # registries/repositories that couldn't be read
+    stuck = {}                          # digest -> failures, for images given up on (scan_one)
     try:
         entries = repositories(cfg, clients)
     except Exception as e:
@@ -463,29 +580,87 @@ def one_pass(cfg, db, dry_run=False):
             continue
         log(f"{entry['repo']}: {len(tags)} tag(s) in scope")
         for image, repo, tag, digest in tags:
-            prev = done.find_one({"image": image, "digest": digest})
-            if prev and prev.get("status") == "ok":
+            if done.find_one({"image": image, "digest": digest, "status": "ok"}):
                 continue
-            if prev and prev.get("attempts", 0) >= MAX_ATTEMPTS:
-                log(f"  giving up on {image} after {prev['attempts']} failures")
-                continue
+            # Given up on: counted per image, so tags that share a digest don't each get their
+            # own tries, and per SBOM_SCAN_TIMEOUT, so a new timeout gives the image new tries
+            given_up = None if retry or digest in stuck else done.find_one(
+                {"digest": digest, "status": "failed", "timeout": scan_all.SCAN_TIMEOUT,
+                 "attempts": {"$gte": MAX_ATTEMPTS}})
+            if given_up:
+                stuck[digest] = given_up["attempts"]
             todo.append((image, repo, tag, digest, reg_name))
 
     if entries and len(unlisted) == len(entries):   # couldn't read any of them
         for u in unlisted:
             u["whole"] = True
-    log(f"{len(todo)} image(s) not yet scanned")
-    if dry_run:
-        for image, _, _, digest, _ in todo:
-            print(f"  would scan {image}  {digest[:19]}")
-        return unlisted
-    if not todo:
-        return unlisted
 
-    trivy = scan_all.prepare_trivy()    # one DB for the whole pass, as in scan_all.py
+    # Tags that need no scan of their own: the same image was scanned on this machine in this
+    # run (--local), or under another tag in an earlier pass. They're recorded as done.
+    skipped, already, remaining, abandoned = [], [], [], {}
+    for item in todo:
+        image, repo, _, digest, reg_name = item
+        # How this machine may know the image: the digest Docker recorded when it was pulled
+        # or pushed, or its image ID (the digest itself on Docker's containerd image store,
+        # the config digest on the classic store)
+        keys = [digest_ref(image, digest), digest]
+        if here.names and reg_name in clients:
+            try:
+                keys.append(clients[reg_name].config_digest(repo, digest, platform))
+            except Exception:
+                pass                    # the registry won't say; the other two still apply
+        seen_as = next((here.scanned[k] for k in keys if k in here.scanned), None)
+        if seen_as:
+            already.append((item, seen_as))
+            continue
+        if any(k in here.failed for k in keys):
+            log(f"  {image}: its scan on this machine failed above, so it isn't downloaded")
+            continue
+        prev = done.find_one({"digest": digest, "status": "ok"})
+        if prev:
+            already.append((item, prev.get("same_as") or prev["image"]))
+        elif digest in stuck:
+            log(f"  giving up on {image}: it failed {stuck[digest]} times")
+            abandoned.setdefault(digest, {"image": image, "status": "abandoned"})
+        elif image in here.names:
+            # Scanning the registry's version under the same name as this machine's image
+            # would mix two different images in one record, and this machine's was scanned
+            # above. The run summary counts these as skipped.
+            log(f"  {image}: skipped, this machine has a different image under this name; "
+                "the registry's is scanned once they match")
+            skipped.append({"image": image, "status": "skipped"})
+        else:
+            remaining.append(item)
+    if already:
+        log(f"{len(already)} tag(s) already scanned as an identical image")
+    if already and not dry_run:
+        now = datetime.now(timezone.utc)
+        for item, same_as in already:
+            mark_done(done, item, same_as, now)
+
+    groups = {}                         # tags that share a digest are one image: scan it once
+    for item in remaining:
+        groups.setdefault(item[3], []).append(item)
+    plan = []
+    for digest, items in groups.items():
+        by_name = {item[0]: item for item in items}
+        primary = scan_all.choose_primary(db, scan_all.HOSTNAME, list(by_name), digest=digest)
+        plan.append((by_name[primary], [item for name, item in by_name.items() if name != primary]))
+
+    log(f"{len(plan)} image(s) not yet scanned" +
+        (f" ({len(remaining)} tags)" if len(remaining) != len(plan) else ""))
+    unscanned = unlisted + list(abandoned.values()) + skipped
+    if dry_run:
+        for (image, _, _, digest, _), others in plan:
+            print(f"  would scan {image}  {digest[:19]}" + also_tagged([o[0] for o in others]))
+        return unscanned
+    if not plan:
+        return unscanned
+
+    trivy = trivy or scan_all.prepare_trivy()   # one DB for the whole pass, as in scan_all.py
     root = docker_root()
     results = []
-    for n, item in enumerate(todo, 1):
+    for n, (item, others) in enumerate(plan, 1):
         image, repo, _, digest, reg_name = item
         size = None
         if reg_name in clients:
@@ -493,20 +668,70 @@ def one_pass(cfg, db, dry_run=False):
                 size = clients[reg_name].size(repo, digest, platform)
             except Exception:
                 pass                        # size unknown: only the minimum free space is checked
-        log(f"[{n}/{len(todo)}] {image}" + (f"  ({size / 1e9:.1f} GB)" if size else ""))
-        results.append(process(db, item, trivy, platform, size=size, root=root))
-    return unlisted + results
+        log(f"[{n}/{len(plan)}] {image}" + (f"  ({size / 1e9:.1f} GB)" if size else "") +
+            also_tagged([o[0] for o in others]))
+        results.append(process(db, item, trivy, platform, size=size, root=root, others=others,
+                               seen=here.scanned))
+    return unscanned + results
+
+
+def also_tagged(names):
+    return f"  (also tagged {', '.join(names)})" if names else ""
+
+
+def scan_machine(db, rows, dry_run):
+    """--local: scan the images already on this machine, once per image and without
+    downloading anything (scan_all.py's code). Returns (trivy, here, results): the Trivy
+    versions, for the registry pass to reuse; what is on this machine and how its scans
+    went (OnThisMachine); and one result per image, in this script's form."""
+    ids = {row["name"]: row["id"] for row in rows if row["name"]}
+    names = sorted(ids)
+    groups = scan_all.group_by_image(names, ids)
+    log(f"This machine: {len(groups)} image(s) ({len(names)} tags), scanned without downloading")
+    if not groups:
+        return None, NOTHING_HERE, []
+
+    trivy, results, reported = None, [], {}     # reported: image ID -> the name it was reported under
+    if dry_run:
+        for group in groups:
+            primary = scan_all.choose_primary(db, scan_all.HOSTNAME, group, image_id=ids[group[0]])
+            print(f"  would scan {primary}" + also_tagged([n for n in group if n != primary]))
+            reported[ids[primary]] = primary
+    else:
+        trivy = scan_all.prepare_trivy()
+        for r in scan_all.scan_local(db, names, ids, trivy, say=log):
+            if "error" in r:
+                results.append({"image": r["image"], "status": "failed",
+                                "error": r.get("detail") or r["error"]})
+            else:
+                results.append({"image": r["image"], "status": "ok"})
+                reported[ids[r["image"]]] = r["image"]
+    failed_ids = set(ids.values()) - set(reported)
+    scanned = dict(reported)            # by image ID, and by every registry digest Docker has for it
+    scanned.update({row["digest_ref"]: reported[row["id"]] for row in rows
+                    if row["digest_ref"] and row["id"] in reported})
+    failed = failed_ids | {row["digest_ref"] for row in rows
+                           if row["digest_ref"] and row["id"] in failed_ids}
+    return trivy, OnThisMachine(frozenset(names), scanned, frozenset(failed)), results
 
 
 def main(argv=None):
-    return scan_all.reported("registry", _main, argv)
+    argv = sys.argv[1:] if argv is None else argv
+    return scan_all.reported("local+registry" if "--local" in argv else "registry", _main, argv)
 
 
 def _main(argv):
     ap = argparse.ArgumentParser(description="Scan registry images once each, ship changes to Wazuh.")
     ap.add_argument("--config", default="registries.json")
     ap.add_argument("--dry-run", action="store_true", help="list what would be scanned, pull nothing")
+    ap.add_argument("--local", action="store_true",
+                    help="first scan every image already on this machine, without downloading "
+                         "it; then download from the registry only what isn't here")
+    ap.add_argument("--retry-failed", action="store_true",
+                    help=f"give images that failed {MAX_ATTEMPTS} times, and are no longer tried, "
+                         f"another {MAX_ATTEMPTS} tries")
     args = ap.parse_args(argv)
+    scan_all.check_settings()
 
     try:
         with open(args.config) as f:
@@ -517,6 +742,7 @@ def _main(argv):
 
     if not args.dry_run:
         lock = scan_all.acquire_lock(OUT_DIR)  # noqa: F841 (held until exit; shared with scan_all.py)
+    rows = scan_all.local_images() if args.local else []
     scan_all.check_out_dir(REG_OUT)
     scan_all.check_wazuh_log(scan_all.WAZUH_JSONL)
     db = get_db()
@@ -525,20 +751,33 @@ def _main(argv):
             log(f"old-format state set aside as {name} (kept, not deleted)")
         scan_all.ensure_indexes(db)
         db["registry_scans"].create_index([("image", 1), ("digest", 1)], unique=True)
+        if args.retry_failed:
+            n = db["registry_scans"].update_many({"status": "failed", "attempts": {"$gt": 0}},
+                                                 {"$set": {"attempts": 0}}).modified_count
+            log(f"{n} failed image(s) get new tries")
     log(f"Registry scanner on {scan_all.HOSTNAME}, Trivy {scan_all.TRIVY_IMAGE}")
 
-    results = one_pass(cfg, db, dry_run=args.dry_run)
+    trivy, here, results = None, NOTHING_HERE, []
+    if args.local:
+        trivy, here, results = scan_machine(db, rows, args.dry_run)
+    results += one_pass(cfg, db, dry_run=args.dry_run, trivy=trivy, here=here, retry=args.retry_failed)
     ok = sum(r["status"] == "ok" for r in results)
     failed = sum(r["status"] == "failed" for r in results)
+    skipped = sum(r["status"] == "skipped" for r in results)
+    abandoned = sum(r["status"] == "abandoned" for r in results)
     unlisted = [r for r in results if r["status"] == "unlisted"]
     if not args.dry_run:
-        problems = [f"{r['image']}: {r['error']}" for r in results if r.get("error")]
+        warnings = [f"{r['image']}: {r['warning']}" for r in results if r.get("warning")]
+        problems = [f"{r['image']}: {r['error']}" for r in results if r.get("error")] + warnings
         if any(r.get("whole") for r in unlisted) or (failed and not ok):
             status = "error"            # the registry couldn't be read, or no image could be scanned
-        else:
-            status = "failed" if failed or unlisted else "ok"
-        scan_all.report_run("registry", ok, failed + len(unlisted), problems, status=status)
+        else:                           # a download left on the machine needs someone too
+            status = "failed" if failed or unlisted or warnings else "ok"
+        scan_all.report_run("local+registry" if args.local else "registry", ok, failed + len(unlisted),
+                            problems, status=status, skipped=skipped, abandoned=abandoned)
     log(f"Pass complete: {ok} scanned, {failed} failed"
+        + (f", {skipped} skipped" if skipped else "")
+        + (f", {abandoned} given up on" if abandoned else "")
         + (f", {len(unlisted)} could not be listed" if unlisted else ""))
     return 1 if failed or unlisted else 0
 

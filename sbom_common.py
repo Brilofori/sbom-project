@@ -82,7 +82,12 @@ def identity(purl, ctype=None, name=None):
 
 
 def latest_scans(db, host=None, image=None):
-    """The most recent scan document for every (host, image) pair."""
+    """The most recent scan document for every (host, image) pair, one per image: when an
+    image (image ID) was reported under more than one name, only its latest one is kept.
+    A host-mode name later reported as another image's other tag is left out too: its own
+    last scan is out of date, and an image still on the machine is scanned again under
+    its current name. (A registry image keeps the tag it was scanned under, since it may
+    still be served under other tags.)"""
     match = {}
     if host:
         match["host"] = host
@@ -94,4 +99,16 @@ def latest_scans(db, host=None, image=None):
         {"$group": {"_id": {"host": "$host", "image": "$image"}, "scan_id": {"$first": "$_id"}}},
     ]
     ids = [d["scan_id"] for d in db["scans"].aggregate(pipeline, allowDiskUse=True)]
-    return list(db["scans"].find({"_id": {"$in": ids}}).sort([("image", 1), ("host", 1)]))
+    scans = list(db["scans"].find({"_id": {"$in": ids}}).sort([("image", 1), ("host", 1)]))
+    newest = {}                         # (host, image ID) -> its latest scan under any name
+    for s in scans:
+        key = (s["host"], s.get("image_id"))
+        if s.get("image_id") and (key not in newest or s["scanned_at"] > newest[key]["scanned_at"]):
+            newest[key] = s
+    scans = [s for s in scans if not s.get("image_id") or newest[(s["host"], s["image_id"])] is s]
+    when = {(s["host"], s["image"]): s["scanned_at"] for s in scans}
+    merged = {(s["host"], name) for s in scans
+              for name in (s.get("other_tags") or "").split(", ")
+              if name and when.get((s["host"], name), s["scanned_at"]) < s["scanned_at"]}
+    return [s for s in scans if (s["host"], s["image"]) not in merged
+            or s.get("scanner_mode") == "registry"]

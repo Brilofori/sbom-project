@@ -106,7 +106,10 @@ def merge_boms(entries, name="SWERI container estate", version=None, timestamp=N
 def load_entries(scans):
     entries, skipped = [], []
     for scan in scans:
-        path = Path(scan.get("source_file") or "")
+        if not scan.get("source_file"):
+            skipped.append(f"{scan['image']}: no saved SBOM")
+            continue
+        path = Path(scan["source_file"])
         if not path.is_absolute():
             path = BASE_DIR / path
         try:

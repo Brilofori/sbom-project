@@ -7,6 +7,9 @@ Usage:
     python3 scan_all.py images.txt       scan only the images listed (one per line, # comments ok)
     python3 scan_all.py --rebaseline     forget previous state and resend everything once
 
+Images are read from this machine's Docker only; nothing is downloaded. Tags that are the
+same image (same image ID) are scanned once and reported under one name.
+
 Per image: Trivy -> CycloneDX JSON (out/) -> compare with state in MongoDB -> append
 changes to the Wazuh log -> commit state -> save the scan.
 Events are written *before* state is committed, so a failed write is retried next run
@@ -16,6 +19,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -40,6 +44,10 @@ TRIVY_CACHE_VOLUME = os.environ.get("SBOM_TRIVY_CACHE", "trivy-cache")
 WAZUH_JSONL = os.environ.get("SBOM_WAZUH_LOG", "/var/log/sbom/trivy-findings.jsonl")
 # The Wazuh agent forwards 500 events/s by default and drops overflow; stay under it.
 WAZUH_EPS = int(os.environ.get("SBOM_WAZUH_EPS", "400"))
+# Longest one image's scan may take, as a Trivy duration (30m, 90m, 2h). Raise it for very
+# large images.
+SCAN_TIMEOUT = os.environ.get("SBOM_SCAN_TIMEOUT", "").strip() or "30m"
+_DURATION = re.compile(r"^(\d+(\.\d+)?(h|m|s|ms))+$")
 
 TRIVY_REPOS = {"aquasec/trivy", "trivy", "ghcr.io/aquasecurity/trivy",
                "public.ecr.aws/aquasecurity/trivy"}
@@ -50,6 +58,12 @@ _RECOMMENDATION = re.compile(r"^Upgrade (?P<pkg>.+?) to version (?P<ver>.+)$")
 
 class ScanError(Exception):
     """Trivy failed for one image."""
+
+
+def check_settings():
+    """Stop with a clear message on a setting that would make every scan fail."""
+    if not _DURATION.match(SCAN_TIMEOUT) or not re.search(r"[1-9]", SCAN_TIMEOUT):
+        sys.exit(f"SBOM_SCAN_TIMEOUT={SCAN_TIMEOUT!r} isn't a duration. Use e.g. 30m, 90m or 2h.")
 
 
 # --------------------------------------------------------------------------- Trivy ---
@@ -101,27 +115,43 @@ def prepare_trivy():
     return version, db_updated, db_ready
 
 
-def scan_image(image, out_dir, skip_db_update):
+def scan_image(image, out_dir, skip_db_update, target=None):
     """Run Trivy against one image; return the CycloneDX output path or raise ScanError.
+    `target` is the reference Trivy reads (default `image`, which names the output file).
+
+    Trivy reads the image from this machine's Docker only (--image-src docker). It never
+    downloads it, so the result always describes the copy on this machine, and an image
+    that isn't here fails with a clear error instead of being fetched from a registry.
 
     Trivy writes to a .partial file that replaces out/<image>.json only on success, so
     a failed scan never leaves a stale or half-written file, and the last good SBOM for
-    the image is kept (export_cyclonedx.py uses it)."""
+    the image is kept (export_cyclonedx.py uses it). Trivy runs as root, so the files it
+    writes are only ever renamed or replaced here, never written to: the scanner's own
+    user can do that with write access to the folder."""
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{safe_name(image)}.json"
     partial = out_dir / f"{safe_name(image)}.json.partial"
     partial.unlink(missing_ok=True)
 
-    args = ["image", "--scanners", "vuln", "--format", "cyclonedx", "--timeout", "30m",
-            "--no-progress", "--output", f"/out/{partial.name}"]
+    args = ["image", "--image-src", "docker", "--scanners", "vuln", "--format", "cyclonedx",
+            "--timeout", SCAN_TIMEOUT, "--no-progress", "--output", f"/out/{partial.name}"]
     if skip_db_update:
         args.append("--skip-db-update")
-    cmd = trivy_cmd(*args, image, mounts=("/var/run/docker.sock:/var/run/docker.sock",
-                                          f"{out_dir.resolve()}:/out"))
+    cmd = trivy_cmd(*args, target or image, mounts=("/var/run/docker.sock:/var/run/docker.sock",
+                                                    f"{out_dir.resolve()}:/out"))
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not partial.exists():
         partial.unlink(missing_ok=True)
         raise ScanError(error_tail(r.stderr) or f"Trivy exited {r.returncode} without output")
+    if target and target != image:      # Trivy names the SBOM after what it read: use the image's name
+        with open(partial, encoding="utf-8") as f:
+            bom = json.load(f)
+        if (bom.get("metadata") or {}).get("component"):
+            bom["metadata"]["component"]["name"] = image
+            named = out_dir / f"{safe_name(image)}.json.named.partial"
+            with open(named, "w", encoding="utf-8") as f:
+                json.dump(bom, f, indent=2)
+            os.replace(named, partial)
     os.replace(partial, out_path)
     return out_path
 
@@ -394,11 +424,12 @@ def reported(mode, run, argv):
         raise
 
 
-def report_run(mode, scanned, failed, errors=(), status=None, path=None):
+def report_run(mode, scanned, failed, errors=(), status=None, path=None, **counts):
     """Send Wazuh one summary event for the whole run, so a scanner that stops working shows
     up in the dashboard instead of looking like a quiet day. status: "ok", "failed" (some
-    images failed) or "error" (the run couldn't scan anything). Never raises: a summary
-    that can't be written must not hide the real problem."""
+    images failed) or "error" (the run couldn't scan anything). `counts` are added as they
+    are: registry mode's `skipped` and `abandoned`. Never raises: a summary that can't be
+    written must not hide the real problem."""
     if not status:
         status = "ok" if not failed else "failed" if scanned else "error"
     errors = "; ".join(errors)
@@ -408,6 +439,7 @@ def report_run(mode, scanned, failed, errors=(), status=None, path=None):
     event = {"source": "trivy", "sbom_event": "scan_run", "scanner_mode": mode,
              "host": HOSTNAME, "run_status": status, "scanned": scanned, "failed": failed,
              "errors": errors}
+    event.update(counts)
     try:
         deliver([event], path, eps=0)
     except OSError:
@@ -522,10 +554,24 @@ def ensure_indexes(db):
     db["vuln_state"].create_index([("host", 1), ("image", 1), ("cve_id", 1), ("identity", 1)],
                                   unique=True)
     db["scans"].create_index([("host", 1), ("image", 1), ("scanned_at", -1)])
+    db["scans"].create_index([("host", 1), ("image_id", 1), ("scanned_at", -1)])
     db["cve_info"].create_index("cve_id", unique=True)
 
 
 # ------------------------------------------------------------------------- inputs ---
+
+def familiar(name):
+    """A name the way `docker images` lists it: nginx is nginx:latest, and
+    docker.io/library/nginx:1 is nginx:1. A digest or image ID is left as it is."""
+    if "@" in name or name.startswith("sha256:"):
+        return name
+    if ":" not in name.rsplit("/", 1)[-1]:
+        name += ":latest"
+    for prefix in ("docker.io/library/", "index.docker.io/library/", "docker.io/", "index.docker.io/"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
 
 def read_inventory(path):
     images = []
@@ -537,25 +583,236 @@ def read_inventory(path):
     return list(dict.fromkeys(images))  # de-duplicate, keep order
 
 
-def discover_images():
-    """Every tagged image on this host (running or not), except Trivy itself."""
+def local_images():
+    """Every image on this host (running or not) except Trivy itself: one row per name and
+    registry digest, {"name": "repo:tag", "id": image ID, "digest_ref": "repo@sha256:..."}.
+    digest_ref is a registry digest Docker has recorded for the image (on Docker's classic
+    image store, one it was pulled or pushed as), or None. A digest whose repository has
+    no tag on the image, often left behind when that tag moved to a newer build, has a
+    row with name None: it still says which registry image this is."""
     try:
-        r = subprocess.run(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
+        r = subprocess.run(["docker", "images", "--no-trunc", "--digests", "--format",
+                            "{{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.Repository}}@{{.Digest}}"],
                            capture_output=True, text=True)
     except FileNotFoundError:
         sys.exit("docker not found on PATH")
     if r.returncode != 0:
         sys.exit(f"'docker images' failed: {error_tail(r.stderr, 4)}\n"
                  "Is Docker running, and is this user in the docker group?")
-    images = set()
+    rows, seen = [], set()
     for raw in r.stdout.splitlines():
-        ref = raw.strip()
-        if not ref or "<none>" in ref:
+        parts = raw.strip().split("\t")
+        if len(parts) != 3:
             continue
-        if ref.rsplit(":", 1)[0] in TRIVY_REPOS:
+        image_id, name, digest_ref = parts
+        repo, _, tag = name.rpartition(":")
+        if repo == "<none>" or repo in TRIVY_REPOS:
             continue
-        images.add(ref)
-    return sorted(images)
+        row = {"name": None if tag == "<none>" else name, "id": image_id,
+               "digest_ref": None if digest_ref.endswith("@<none>") else digest_ref}
+        key = (row["name"], row["digest_ref"])
+        if key in seen or key == (None, None):
+            continue
+        seen.add(key)
+        rows.append(row)
+    return rows
+
+
+def image_id(ref):
+    """The ID of the image `ref` names on this machine, or None if Docker says there is no
+    such image. Raises RuntimeError if Docker can't be asked (it is slow, or stopped), so
+    that a Docker that doesn't answer is never taken to mean the image isn't here."""
+    try:
+        r = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", ref],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"couldn't ask Docker about {ref}: {e}") from None
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    if "no such image" in r.stderr.lower():
+        return None
+    raise RuntimeError(f"couldn't ask Docker about {ref}: {error_tail(r.stderr, 2) or 'no answer'}")
+
+
+def _is_qualified(name):
+    """True if the name starts with a registry address (a host with a dot or a port, or
+    localhost), e.g. registry.example.com/app:1, as opposed to a bare name like app:1."""
+    first, slash, _ = name.partition("/")
+    return bool(slash) and ("." in first or ":" in first or first == "localhost")
+
+
+def name_rank(name):
+    """Which of an image's names to report it under: a fixed tag before `latest` (latest
+    moves to new builds), a name with a registry address before a bare one, then A to Z."""
+    last = name.rsplit("/", 1)[-1]
+    tag = last.rsplit(":", 1)[1] if ":" in last else "latest"
+    return (tag == "latest", not _is_qualified(name), name)
+
+
+def choose_primary(db, host, names, image_id=None, digest=None):
+    """The name to report an image under, from the names (tags) it has now. A name this same
+    image was last reported under keeps being used, so nothing is sent again. A name whose
+    last report was a different image doesn't count: that tag has moved on to a newer
+    build. Otherwise the best name by name_rank. The image is recognised by its local
+    image ID, or, for a registry image not yet downloaded, by its registry digest."""
+    names = list(names)
+    kept = []
+    for name in names if image_id or digest else []:
+        last = db["scans"].find_one({"host": host, "image": name}, sort=[("scanned_at", -1)],
+                                    projection={"image_id": 1, "digest": 1})
+        if last and ((image_id and last.get("image_id") == image_id)
+                     or (digest and last.get("digest") == digest)):
+            kept.append(name)
+    return min(kept or names, key=name_rank)
+
+
+def last_scan(db, host, name, fields=None):
+    """The latest scan saved under this name on this host, or None."""
+    return db["scans"].find_one({"host": host, "image": name}, sort=[("scanned_at", -1)],
+                                projection=fields)
+
+
+def last_name(db, host, image_id):
+    """The name this host last reported this image under, if what is recorded under that
+    name still describes this image (no other image has been reported under it since)."""
+    last = db["scans"].find_one({"host": host, "image_id": image_id}, sort=[("scanned_at", -1)],
+                                projection={"image": 1})
+    if not last:
+        return None
+    latest = last_scan(db, host, last["image"], {"image_id": 1})
+    return last["image"] if latest and latest.get("image_id") == image_id else None
+
+
+def settle_names(db, host, plan, ids):
+    """Before any scan: an image whose name changed, because the tag it was reported under
+    moved to a newer build or was removed, takes its record (packages, vulnerabilities and
+    last scan) to its new name, so it only sends what changed, not its whole contents again.
+    The old name keeps its copy if another image now has that tag, so that image's first
+    scan shows what changed from this one; otherwise the old copy is removed.
+
+    `plan` is [(name to report, its group of names)]. An image's record is wherever it was
+    last reported (last_name). Every record is read before any is written, so one move
+    never picks up another's result."""
+    moves = []
+    for image, _ in plan:
+        old = last_name(db, host, ids[image]) if image in ids else None
+        if old and old != image:
+            moves.append((old, image))
+    records = {old: read_record(db, host, old) for old, _ in moves}
+    for old, new in moves:
+        write_record(db, host, new, records[old], old)
+    for old, _ in moves:
+        if old not in ids:              # no image here has that tag any more
+            for coll in ("component_state", "vuln_state"):
+                db[coll].delete_many({"host": host, "image": old})
+
+
+def read_record(db, host, name):
+    return {"scan": last_scan(db, host, name),
+            **{coll: list(db[coll].find({"host": host, "image": name}, {"_id": 0}))
+               for coll in ("component_state", "vuln_state")}}
+
+
+def write_record(db, host, name, record, old):
+    """Put a record read by read_record() under `name`, replacing what was there. A short
+    entry in `scans` (marked carried_from, and not a scan) says which image the record now
+    under `name` describes, and points at a copy of its SBOM, so that holds even before
+    `name` is first scanned."""
+    for coll in ("component_state", "vuln_state"):
+        db[coll].delete_many({"host": host, "image": name})
+        if record[coll]:
+            db[coll].insert_many([{**doc, "image": name} for doc in record[coll]])
+    scan = record["scan"] or {}
+    db["scans"].insert_one({"host": host, "image": name, "image_id": scan.get("image_id"),
+                            "scanned_at": datetime.now(timezone.utc), "carried_from": old,
+                            "source_file": copy_sbom(scan.get("source_file"), name)})
+
+
+def copy_sbom(path, name):
+    """Copy a saved SBOM file to the one `name` is saved under. Returns the copy's path, or
+    None if there is nothing to copy or it can't be copied. The copy is a new file put in
+    place, since one Trivy wrote belongs to root and can't be written over."""
+    if not path or not os.path.isfile(path):
+        return None
+    target = OUT_DIR / f"{safe_name(name)}.json"
+    temp = OUT_DIR / f"{safe_name(name)}.json.copy.partial"
+    try:
+        shutil.copyfile(path, temp)
+        os.replace(temp, target)
+    except OSError:
+        temp.unlink(missing_ok=True)
+        return None
+    return str(target)
+
+
+def forget(db, host, names):
+    """Drop what is recorded under names that are now other tags of an image reported under
+    another name: those records describe an image the names no longer show."""
+    if names:
+        for coll in ("component_state", "vuln_state"):
+            db[coll].delete_many({"host": host, "image": {"$in": list(names)}})
+
+
+def group_by_image(names, ids):
+    """Group names that are the same image (same ID), keeping first-seen order. A name with
+    no known ID stands alone."""
+    groups, by_id = [], {}
+    for name in names:
+        image_id = ids.get(name)
+        if image_id is None:
+            groups.append([name])
+            continue
+        if image_id not in by_id:
+            by_id[image_id] = []
+            groups.append(by_id[image_id])
+        by_id[image_id].append(name)
+    return groups
+
+
+def _say_host(msg):
+    print(f"     {msg.strip()}" if msg.startswith(" ") else f"\n  {msg}")
+
+
+def scan_local(db, names, ids, trivy, say=_say_host, unknown=None):
+    """Scan images that are on this machine, once per image: names that are the same image
+    are scanned once and reported under one name (choose_primary), with the others in the
+    events' `other_tags`. `ids` maps every name on the machine to its image ID; `unknown`
+    gives the reason for a name Docker couldn't look up. Returns one result per image:
+    ingest()'s summary plus `other_tags`, or {"image", "error", "detail"}."""
+    version, db_updated, db_ready = trivy
+    plan = [(choose_primary(db, HOSTNAME, group, image_id=ids.get(group[0])), group)
+            for group in group_by_image(names, ids)]
+    settle_names(db, HOSTNAME, plan, ids)
+    results = []
+    for image, group in plan:
+        others = [n for n in group if n != image]
+        say(f"scanning {image}" + (f"  (also tagged {', '.join(others)})" if others else ""))
+        if image not in ids:
+            detail = (unknown or {}).get(image) or \
+                "not among this machine's images: pull it first, or scan it with registry mode"
+            say(f"  failed: {detail}")
+            results.append({"image": image, "error": "not on this machine", "detail": detail})
+            continue
+        try:
+            # By image ID: a tag can move to a newer build while a long run is under way
+            sbom_path = scan_image(image, OUT_DIR, skip_db_update=db_ready, target=ids[image])
+            r = ingest(db, image, sbom_path, scanner_version=version, db_updated=db_updated,
+                       extra={"other_tags": ", ".join(others)} if others else None)
+            forget(db, HOSTNAME, others)
+        except ScanError as e:
+            say("  scan failed:\n     " + str(e).replace("\n", "\n     "))
+            results.append({"image": image, "error": "scan failed",
+                            "detail": str(e).strip().splitlines()[-1][-300:] if str(e).strip() else ""})
+            continue
+        except Exception as e:  # keep going with the other images; state was not committed
+            say(f"  failed: {type(e).__name__}: {e}")
+            results.append({"image": image, "error": type(e).__name__, "detail": str(e)[-300:]})
+            continue
+        results.append({**r, "other_tags": others})
+        say(f"  {r['packages']} packages ({r['added']} new, {r['changed']} changed, "
+            f"{r['removed']} removed)  |  {r['vulnerabilities']} vulns ({r['new_vulns']} new, "
+            f"{r['resolved']} resolved)  |  {r['sent']} events to wazuh")
+    return results
 
 
 def check_wazuh_log(path):
@@ -613,13 +870,25 @@ def _main(argv):
     ap.add_argument("--rebaseline", action="store_true",
                     help="set current state aside and resend the full inventory to Wazuh")
     args = ap.parse_args(argv)
+    check_settings()
 
+    if args.inventory and not os.path.isfile(args.inventory):
+        sys.exit(f"Inventory file not found: {args.inventory}")
+    ids = {row["name"]: row["id"] for row in local_images() if row["name"]}
+    unknown = {}                        # inventory names Docker couldn't look up, and why
     if args.inventory:
-        if not os.path.isfile(args.inventory):
-            sys.exit(f"Inventory file not found: {args.inventory}")
-        images, source = read_inventory(args.inventory), f"inventory file {args.inventory}"
+        images = list(dict.fromkeys(familiar(name) for name in read_inventory(args.inventory)))
+        source = f"inventory file {args.inventory}"
+        for name in images:
+            if name not in ids:         # written another way, e.g. "nginx" for nginx:latest
+                try:
+                    found = image_id(name)
+                except RuntimeError as e:
+                    found, unknown[name] = None, str(e)
+                if found:
+                    ids[name] = found
     else:
-        images, source = discover_images(), "host image discovery"
+        images, source = sorted(ids), "host image discovery"
     if not images:
         sys.exit("No images found to scan")
 
@@ -636,30 +905,12 @@ def _main(argv):
     version, db_updated, db_ready = prepare_trivy()
     print(f"\nSBOM pipeline  {run_time}")
     print(f"host {HOSTNAME}  |  trivy {version}  |  DB {db_updated or 'unknown'}  |  "
-          f"{len(images)} images via {source}")
+          f"{len(group_by_image(images, ids))} images ({len(images)} tags) via {source}")
     if moved:
         print(f"  previous state moved to {', '.join(moved)}: this run re-sends the full "
               "inventory to Wazuh once")
 
-    results = []
-    for image in images:
-        print(f"\n  scanning  {image}")
-        try:
-            sbom_path = scan_image(image, OUT_DIR, skip_db_update=db_ready)
-            r = ingest(db, image, sbom_path, scanner_version=version, db_updated=db_updated)
-        except ScanError as e:
-            print("     scan failed:\n     " + str(e).replace("\n", "\n     "))
-            results.append({"image": image, "error": "scan failed",
-                            "detail": str(e).strip().splitlines()[-1][-300:] if str(e).strip() else ""})
-            continue
-        except Exception as e:  # keep going with the other images; state was not committed
-            print(f"     failed: {type(e).__name__}: {e}")
-            results.append({"image": image, "error": type(e).__name__, "detail": str(e)[-300:]})
-            continue
-        results.append(r)
-        print(f"     {r['packages']} packages ({r['added']} new, {r['changed']} changed, "
-              f"{r['removed']} removed)  |  {r['vulnerabilities']} vulns ({r['new_vulns']} new, "
-              f"{r['resolved']} resolved)  |  {r['sent']} events to wazuh")
+    results = scan_local(db, images, ids, (version, db_updated, db_ready), unknown=unknown)
 
     failed = [r for r in results if "error" in r]
     report_run("host", len(results) - len(failed), len(failed),
@@ -670,7 +921,8 @@ def _main(argv):
             print(f"  x  {r['image']}  {r['error']}")
         else:
             flag = "  *" if r["sent"] else "   "
-            print(f"{flag} {r['image']}  {r['packages']} pkg, {r['vulnerabilities']} vuln  "
+            also = f" (+{len(r['other_tags'])} tags)" if r.get("other_tags") else ""
+            print(f"{flag} {r['image']}{also}  {r['packages']} pkg, {r['vulnerabilities']} vuln  "
                   f"(+{r['new_vulns']} vuln, -{r['resolved']} resolved, "
                   f"{r['added']}/{r['changed']}/{r['removed']} pkg added/changed/removed)")
     return 1 if failed else 0
